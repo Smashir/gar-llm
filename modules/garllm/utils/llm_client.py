@@ -108,7 +108,7 @@ def request_llm(
     # === OpenAI互換 (LM Studio含む) ===
     elif backend == "openai":
         base = os.getenv("OPENAI_API_BASE", "http://localhost:1234/v1")
-        key = os.getenv("OPENAI_API_KEY", "sk-local")
+        key = os.getenv("OPENAI_API_KEY")
         url = base + "/chat/completions"
         payload = {
             "model": model or "gpt-3.5-turbo",

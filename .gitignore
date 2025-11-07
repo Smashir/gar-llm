@@ -4,6 +4,9 @@ webui/data/cache/
 webui/data/vector_db/
 webui/data/uploads/
 webui/data/webui.db
+webui/logs/
+webui/cache/
+
 
 # Python environments
 __pycache__/
@@ -25,3 +28,6 @@ venv/
 
 # Misc
 *.zip
+.env
+*.env
+*.sqlite3

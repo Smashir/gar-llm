@@ -41,14 +41,16 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from utils.env_utils import get_data_path, ensure_data_dirs  # ✅ env_utils統合
+from style_layer.response_modulator import modulate_response
+from utils.logger import get_logger
+
+
 # ============================================================
 # GAR 環境パス設定
 # ============================================================
 GAR_ROOT = Path(os.path.expanduser("~/modules/garllm"))
 sys.path.append(str(GAR_ROOT))
-
-from utils.env_utils import get_data_path, ensure_data_dirs  # ✅ env_utils統合
-from style_layer.response_modulator import modulate_response
 
 # データディレクトリ初期化
 ensure_data_dirs()
@@ -58,6 +60,12 @@ SEMANTIC_DIR = Path(get_data_path("semantic"))
 RETRIEVED_DIR = Path(get_data_path("retrieved"))
 CLEANED_DIR = Path(get_data_path("cleaned"))
 CONDENSED_DIR = Path(get_data_path("condensed"))
+
+# ============================================================
+# ロガー設定（初期値はINFO、mainで上書き）
+# ============================================================
+
+logger = get_logger("relay_server", level="INFO", to_console=False)
 
 # ============================================================
 # FastAPI 設定
@@ -134,18 +142,18 @@ def _run_step(script_name: str, args: list[str]):
         return False
 
 
-    log_info(f"Running {script_name} {' '.join(args)}", file=sys.stderr)
+    logger.info(f"Running {script_name} {' '.join(args)}", file=sys.stderr)
 
     result = subprocess.run(["python3", str(script_path)] + args, capture_output=True, text=True)
     if result.returncode != 0:
-        log_error(f"Step failed: {script_name}\n{result.stderr}")
+        logger.error(f"Step failed: {script_name}\n{result.stderr}")
         return False
     return True
 
 
 def _auto_generate_persona(persona_name: str) -> bool:
     """retriever → cleaner → condenser → semantic_condenser → thought_profiler → persona_generator を順次起動"""
-    log_info(f"Persona '{persona_name}' not found, auto-generation triggered.", file=sys.stderr)
+    logger.info(f"Persona '{persona_name}' not found, auto-generation triggered.", file=sys.stderr)
 
     steps = [
         ("retriever.py", ["--query", persona_name, "--output", str(RETRIEVED_DIR / f"retrieved_{persona_name}.json")]),
@@ -164,15 +172,15 @@ def _auto_generate_persona(persona_name: str) -> bool:
 
     for script, args in steps:
         if not _run_step(script, args):
-            log_error(f"Persona generation failed at step: {script}", file=sys.stderr)
+            logger.error(f"Persona generation failed at step: {script}", file=sys.stderr)
             return False
 
     persona_path = PERSONA_DIR / f"persona_{persona_name}.json"
     if persona_path.exists():
-        log_info(f"Persona successfully generated: {persona_name}", file=sys.stderr)
+        logger.info(f"Persona successfully generated: {persona_name}", file=sys.stderr)
         return True
     else:
-        log_error(f"Persona file not found after generation: {persona_path}", file=sys.stderr)
+        logger.error(f"Persona file not found after generation: {persona_path}", file=sys.stderr)
         return False
 
 
@@ -184,7 +192,7 @@ def _ensure_persona_exists(persona_name: str):
     return _auto_generate_persona(persona_name)
 
 
-def _run_context_update(persona_name: str, user_text: str, mode: str = "llm", verbose: bool = False):
+def _run_context_update(persona_name: str, user_text: str, mode: str = "llm", debug: bool = False):
     """context_controllerに状態更新だけをやらせる（stdoutは無視）。
        結果はstateファイルを読み直して使う。
     """
@@ -196,13 +204,13 @@ def _run_context_update(persona_name: str, user_text: str, mode: str = "llm", ve
         "--mode", mode,
         "--state_file", state_file,
     ]
-    if verbose:
-        cmd.append("--verbose")
+    if debug:
+        cmd.append("--debug")
 
     # emit_text はサーバー運用では絶対に付けない（stdoutが混ざる）
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    if verbose and proc.stdout:
+    if debug and proc.stdout:
         # デバッグログとしては残してOK（JSONではないのでパースしない）
         print("[context_controller stdout]", proc.stdout.strip())
     if proc.returncode != 0:
@@ -229,7 +237,7 @@ def _run_style_modulator(persona_name: str, text: str, intensity: float, verbose
 
     result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:
-        log_error(f"style_modulator failed:\n{result.stderr}", file=sys.stderr)
+        logger.error(f"style_modulator failed:\n{result.stderr}", file=sys.stderr)
         return text
 
     if "==== Rewritten Text ====" in result.stdout:
@@ -329,7 +337,7 @@ async def chat_completions(request: Request):
     if not messages:
         return JSONResponse(status_code=400, content={"error": "messages is required"})
 
-    # log_debug(f"Received /v1/chat/completions request\n{req}")
+    # logger.debug(f"Received /v1/chat/completions request\n{req}")
 
     # persona 指定を検出する
     persona_name = (
@@ -359,7 +367,7 @@ async def chat_completions(request: Request):
 
         if not already_injected:
             switch_text = f"assistantはここから {persona_name} の人格として応答しています。"
-            log_info(f"Persona switch -> '{persona_name}' (history preserved)")
+            logger.info(f"Persona switch -> '{persona_name}' (history preserved)")
             # LLMが履歴を読み直した際に、GARからの指示が通るようSystem役のメッセージを差し込む
             switch_text = f"assistantはここから {persona_name} の人格として応答しています。"
             messages = inject_system_message(messages, switch_text)
@@ -421,9 +429,9 @@ async def chat_completions(request: Request):
         )
 
     # 状態更新を実行（context_controllerがstateファイルに結果を書き込む）
-    # _run_context_update(persona_name, cleaned_text, mode="llm", verbose=verbose)
+    # _run_context_update(persona_name, cleaned_text, mode="llm", debug=args.debug)
     context_input = json.dumps(messages, ensure_ascii=False)
-    _run_context_update(persona_name, context_input, mode="llm", verbose=verbose)
+    _run_context_update(persona_name, context_input, mode="llm", debug=args.debug)
 
 
     # 更新後のstateを読み出す
@@ -432,14 +440,14 @@ async def chat_completions(request: Request):
     emotion_axes = context_data.get("emotion_axes", {})
 
     # 💬 LLMにリレーするmessages全体を確認
-    log_debug("Messages before response modulation:\n" + json.dumps(messages, ensure_ascii=False, indent=2))
+    logger.debug("Messages before response modulation:\n" + json.dumps(messages, ensure_ascii=False, indent=2))
 
     rewritten = modulate_response(
         text=messages,
         persona_name=persona_name,
         intensity=intensity,
         verbose=verbose,
-        debug=False,
+        debug=args.debug,
         relations=relations,
         emotion_axes=emotion_axes
     )
@@ -461,20 +469,6 @@ async def chat_completions(request: Request):
     }
     return JSONResponse(content=response)
 
-def log_info(msg: str):
-    """--info または DEBUG_MODE 有効時に出力"""
-    if INFO_MODE or DEBUG_MODE:
-        print(f"[INFO] {msg}", file=sys.stderr)
-
-def log_debug(msg: str):
-    """--debug 有効時のみ詳細出力"""
-    if DEBUG_MODE:
-        print(f"[DEBUG] {msg}", file=sys.stderr)
-
-def log_error(msg: str):
-    """常に出力（エラーは例外扱い）"""
-    print(f"[ERROR] {msg}", file=sys.stderr)
-
 # ============================================================
 # エントリポイント
 # ============================================================
@@ -486,24 +480,22 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--persona", type=str, default="default", help="(任意) デフォルトペルソナ名。リクエストに persona がない場合に使用。")
-    parser.add_argument(
-        "--handshake",
-        choices=["on", "off", "auto"],
-        default=os.getenv("GAR_HANDSHAKE", "off"),
-        help="persona 切替時の名乗りハンドシェイク。on/off/auto（環境変数 GAR_HANDSHAKE でも指定可）"
-    )
+    parser.add_argument("--handshake", choices=["on", "off", "auto"],
+                        default=os.getenv("GAR_HANDSHAKE", "off"),
+                        help="ペルソナ切替時の名乗りハンドシェイク（on/off/auto）")
     parser.add_argument("--inject-system", choices=["on", "off"], default=os.getenv("GAR_INJECT_SYSTEM", "on"))
     parser.add_argument("--prefix-persona", choices=["on", "off"], default=os.getenv("GAR_PREFIX_PERSONA", "on"))
+    parser.add_argument("--debug", action="store_true", help="デバッグ出力を有効化（--log-console 併用可）")
+    parser.add_argument("--log-console", action="store_true", help="ログをコンソールにも出力")
 
-    parser.add_argument("--info", action="store_true", help="一般情報（プロンプト出力）")    
-    parser.add_argument("--debug", action="store_true", help="デバッグ表示（プロンプト出力）")
     args = parser.parse_args()
 
     # ============================================================
-    # ログレベル制御（CLI引数 + 環境変数ハイブリッド）
+    # ログレベル制御（--debug オプションを唯一のトリガに）
     # ============================================================
-    INFO_MODE = args.info or os.getenv("GAR_INFO", "false").lower() == "true"
-    DEBUG_MODE = args.debug or os.getenv("GAR_DEBUG", "false").lower() == "true"
+    log_level = "DEBUG" if args.debug else "INFO"
+    logger = get_logger("relay_server", level=log_level, to_console=args.log_console)
 
-    log_info(f"Starting Ghost Assimilation Relay Server on {args.host}:{args.port}")
+    logger.info(f"Starting Ghost Assimilation Relay Server on {args.host}:{args.port} (log_level={log_level})")
+
     uvicorn.run(app, host=args.host, port=args.port)

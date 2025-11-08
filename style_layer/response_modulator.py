@@ -303,7 +303,7 @@ def ask_llm_chat(messages: list[dict[str, str]]) -> str:
         return ""
 
 # ============================================================
-# 🎭 Response Modulation Core（I/Fはそのまま）
+# 🎭 Response Modulation Core
 # ============================================================
 def modulate_response(
     text: str | list[dict[str, str]],

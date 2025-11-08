@@ -39,18 +39,21 @@ sys.path.append(os.path.expanduser("~/modules/"))
 
 from garllm.utils.env_utils import get_data_path
 from garllm.utils.llm_client import request_llm
-
-def _get_state_path(persona_name: str) -> str:
-    """ペルソナ名に対応する state ファイルの絶対パスを返す"""
-    return str(Path(get_data_path("personas")) / f"state_{persona_name}.json")
+from garllm.utils.logger import get_logger
 
 
 # ==========================================
 # Utility
 # ==========================================
 
-# --- 追加ユーティリティ（context_controller.py の上部 or クラス内の近くに置く）---
-import re
+# ロガー初期化
+logger = get_logger("context_controller", level="DEBUG")
+
+
+def _get_state_path(persona_name: str) -> str:
+    """ペルソナ名に対応する state ファイルの絶対パスを返す"""
+    return str(Path(get_data_path("personas")) / f"state_{persona_name}.json")
+
 
 _CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```", re.MULTILINE)
 
@@ -131,7 +134,7 @@ def analyze_context_rule(text: str) -> Dict:
 # LLM文脈解析（堅牢JSON抽出）
 # ==========================================
 
-def analyze_context_llm(text: str, persona_name: str = "default", debug=False) -> Dict:
+def analyze_context_llm(text: str, persona_name: str = "default", debug=False, show_prompt=False) -> Dict:
     """
     LLMベースの文脈解析（6軸Relation + 8軸Emotion対応版）
     GARのペルソナ（AI側）がユーザー発話を受けてどう感じ、関係をどう変化させたかを推定する。
@@ -174,7 +177,10 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False) -
 【会話履歴】
 {text}
 """
-    print(prompt)
+
+    logger.debug("====== [DEBUG PROMPT BEGIN] ======")
+    logger.debug(prompt)
+    logger.debug("====== [DEBUG PROMPT END] ======")
 
     try:
         raw = request_llm(
@@ -184,9 +190,9 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False) -
             max_tokens=600
         ).strip()
 
-        if debug:
-            print("[DEBUG LLM raw output]")
-            print(raw)
+        logger.debug("====== [DEBUG LLM raw Output BEGIN] ======")
+        logger.debug(raw)
+        logger.debug("====== [DEBUG LLM raw Output END] ======")
 
         # JSONブロック抽出（堅牢対応）
         m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw, re.DOTALL)
@@ -203,8 +209,7 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False) -
             rels[target] = {a: clamp(float(v)) for a, v in axes.items()}
         return {"emotion_axes": emo, "relations": rels}
     except Exception as e:
-        if debug:
-            print(f"[WARN] LLM解析失敗: {e}")
+        logger.error(f"LLM context analysis failed: {e}")
         return {"emotion_axes": {k:0.0 for k in ["joy","trust","fear","surprise","sadness","disgust","anger","anticipation"]},
                 "relations": {}}
 
@@ -322,51 +327,56 @@ def main():
     parser.add_argument("--intensity", type=float, default=0.8, help="（CLI検証用）文体強調度(0.0-1.0)")
     parser.add_argument("--mode", choices=["rule", "llm"], default="rule", help="解析モード（rule / llm）")
     parser.add_argument("--emit_text", action="store_true", help="※CLI検証用: 更新状態を用いて応答文も生成して表示する")
-    parser.add_argument("--verbose", action="store_true", help="詳細デバッグ出力")
+    parser.add_argument("--debug", action="store_true", help="デバッグ出力を有効化")
     parser.add_argument("--relations", type=str, help="JSON structure for relations override")
     parser.add_argument("--emotion_axes", type=str, help="JSON structure for emotion axes override")
     args = parser.parse_args()
 
+    # ------------------------------
+    # ロガー設定（--debug で制御）
+    # ------------------------------
+    global logger
+    log_level = "DEBUG" if args.debug else "INFO"
+    logger = get_logger("context_controller", level=log_level, to_console=True)
+
+    logger.info(f"Context Controller started (mode={args.mode}, log_level={log_level})")
+
     # 現在状態をロード
     state = load_state(args.state_file)
+
     # CLI からの直接指定を反映
     if args.relations:
         try:
             state["relations"] = json.loads(args.relations)
-            if args.verbose:
-                print("[DEBUG] Overriding relations from CLI:", json.dumps(state["relations"], ensure_ascii=False, indent=2))
+            logger.debug(f"Overriding relations from CLI: {json.dumps(state['relations'], ensure_ascii=False, indent=2)}")
         except json.JSONDecodeError:
-            print("Error: Invalid JSON for --relations", file=sys.stderr)
+            logger.error("Invalid JSON for --relations")
 
     if args.emotion_axes:
         try:
             state["emotion_axes"] = json.loads(args.emotion_axes)
-            if args.verbose:
-                print("[DEBUG] Overriding emotion_axes from CLI:", json.dumps(state["emotion_axes"], ensure_ascii=False, indent=2))
+            logger.debug(f"Overriding emotion_axes from CLI: {json.dumps(state['emotion_axes'], ensure_ascii=False, indent=2)}")
         except json.JSONDecodeError:
-            print("Error: Invalid JSON for --emotion_axes", file=sys.stderr)
+            logger.error("Invalid JSON for --emotion_axes")
 
     # 文脈解析
     if args.mode == "llm":
-        delta = analyze_context_llm(args.input_text, debug=args.verbose)
+        delta = analyze_context_llm(args.input_text, debug=args.debug, show_prompt=args.debug)
     else:
         delta = analyze_context_rule(args.input_text)
 
     # 状態更新 & 保存
     new_state = update_axes(state, delta)
-    # フェーズ更新
     persona_path = os.path.expanduser(f"~/data/personas/persona_{args.persona}.json")
     updated_state = update_phase_weights(persona_path, new_state, delta)
-
     save_state(args.state_file, updated_state)
 
-    if args.verbose:
-        print("[DEBUG Δ Emotion/Relation]:", json.dumps(delta, ensure_ascii=False, indent=2))
-        print("[DEBUG Updated State]:", json.dumps(new_state, ensure_ascii=False, indent=2))
+    logger.debug(f"Δ Emotion/Relation: {json.dumps(delta, ensure_ascii=False, indent=2)}")
+    logger.debug(f"Updated State: {json.dumps(new_state, ensure_ascii=False, indent=2)}")
 
-    # デフォルトは「状態更新のみ」。応答生成はしない（サーバー側で response_modulator を呼ぶため）
+    # CLI検証用
     if args.emit_text:
-        print(call_response_modulator(args.persona, args.input_text, new_state, args.intensity, args.verbose))
+        print(call_response_modulator(args.persona, args.input_text, new_state, args.intensity, args.debug))
 
 
 # After state update and file write

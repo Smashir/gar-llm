@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: "Ghost Assimilation Relay (GAR)"
+message: "If you use this software, please cite it using the following metadata."
+type: software
+authors:
+  - family-names: Smashir
+    given-names: ""
+abstract: >
+  Ghost Assimilation Relay (GAR) is a persona-driven orchestration framework
+  for modular LLM reasoning and adaptive style control.
+repository-code: "https://github.com/Smashir/gar-llm"
+license: Apache-2.0
+license-additional:
+  - CC-BY-NC-SA-4.0
+version: "0.1.0"
+date-released: "2025-11-09"
+identifiers:
+  - type: doi
+    value: "10.0000/garllm.placeholder"  # replace with real DOI if minted later
+preferred-citation:
+  type: article
+  title: "Ghost Assimilation Relay: Persona-Driven Orchestration for Modular LLMs"
+  authors:
+    - family-names: Smashir
+      given-names: ""
+  year: 2025
+  url: "https://github.com/Smashir/gar-llm"

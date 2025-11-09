@@ -32,5 +32,9 @@ venv/
 *.env
 *.sqlite3
 
-
 .git_local_temp/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gar-llm"                     # ← PyPIでの配布名（ハイフンOK）
+version = "0.1.0"
+description = "Ghost Assimilation Relay (GAR): Modular orchestration framework for LLM reasoning and adaptive persona control."
+readme = "README.md"
+authors = [
+    { name="Smashir", email="27127659+Smashir@users.noreply.github.com" }
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux"
+]
+
+dependencies = [
+    "requests>=2.31.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Smashir/gar-llm"
+"Documentation" = "https://github.com/Smashir/gar-llm#readme"
+"Issues" = "https://github.com/Smashir/gar-llm/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+include-package-data = true

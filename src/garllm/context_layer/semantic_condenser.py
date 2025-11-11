@@ -26,12 +26,11 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, List
 
-# GAR ルートをパスに追加（~/modules/garllm 配下想定）
-sys.path.append(os.path.expanduser("~/modules/garllm"))
+# sys.path.append(os.path.expanduser("~/modules/gar-llm/src/"))
 
 # 内部ユーティリティ
-from utils.env_utils import get_data_path
-from utils.llm_client import request_llm as request_openai
+from garllm.utils.env_utils import get_data_path
+from garllm.utils.llm_client import request_llm as request_openai
 
 # ---- 抽出用キー定義 ---------------------------------------------------------
 PRIMARY_TEXT_KEYS = [

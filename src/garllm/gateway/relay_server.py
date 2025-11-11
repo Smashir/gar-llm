@@ -41,16 +41,22 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from utils.env_utils import get_data_path, ensure_data_dirs  # ✅ env_utils統合
-from style_layer.response_modulator import modulate_response
-from utils.logger import get_logger
-
+import garllm
+from garllm.utils.env_utils import get_data_path, ensure_data_dirs  # ✅ env_utils統合
+from garllm.style_layer.response_modulator import modulate_response
+from garllm.utils.logger import get_logger
 
 # ============================================================
 # GAR 環境パス設定
 # ============================================================
-GAR_ROOT = Path(os.path.expanduser("~/modules/garllm"))
-sys.path.append(str(GAR_ROOT))
+#GAR_ROOT = Path(os.path.expanduser("~/modules/gar-llm/src"))
+#sys.path.append(str(GAR_ROOT))
+
+# garllm モジュールが存在するディレクトリをルートとして使う
+GAR_ROOT = Path(garllm.__file__).resolve().parent
+# もし src 配下がある場合は自動で1階層上がる
+if (GAR_ROOT / "garllm").exists():
+    GAR_ROOT = GAR_ROOT / "garllm"
 
 # データディレクトリ初期化
 ensure_data_dirs()

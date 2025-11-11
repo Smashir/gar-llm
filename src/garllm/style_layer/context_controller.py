@@ -34,8 +34,8 @@ import subprocess
 from typing import Dict
 from pathlib import Path
 
-# ~/modules をパスに追加（プロジェクト直下運用を想定）
-sys.path.append(os.path.expanduser("~/modules/"))
+
+#sys.path.append(os.path.expanduser("~/modules/gar-llm/src/"))
 
 from garllm.utils.env_utils import get_data_path
 from garllm.utils.llm_client import request_llm

@@ -28,7 +28,7 @@ def _sh(cmd: str) -> str:
 def get_active_service() -> Optional[str]:
     """起動中の vLLM systemd ユニット名（vllm@<name>.service）を 1 件返す。"""
     try:
-        out = _sh("systemctl list-units --type=service --state=running | grep -oP 'vllm@[^ ]+\.service' | head -n1")
+        out = _sh(r"systemctl list-units --type=service --state=running | grep -oP 'vllm@[^ ]+\.service' | head -n1")
         return out or None
     except subprocess.CalledProcessError:
         return None

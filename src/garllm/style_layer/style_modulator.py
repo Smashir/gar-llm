@@ -24,8 +24,8 @@ from typing import Dict, Any
 import re
 import sys
 
-# プロジェクトルートをパスに追加
-sys.path.append(os.path.expanduser("~/modules/"))
+
+#sys.path.append(os.path.expanduser("~/modules/gar-llm/src/"))
 
 from garllm.utils.llm_client import request_llm
 from garllm.utils.env_utils import get_data_path

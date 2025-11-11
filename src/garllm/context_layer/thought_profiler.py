@@ -18,7 +18,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
-sys.path.append(os.path.expanduser("~/modules/"))
+# sys.path.append(os.path.expanduser("~/modules/"))
 from garllm.utils.env_utils import get_data_path
 #from garllm.utils.vllm_client import request_openai
 from garllm.utils.llm_client import request_llm as request_openai

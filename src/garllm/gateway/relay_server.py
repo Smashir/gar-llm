@@ -45,6 +45,8 @@ import garllm
 from garllm.utils.env_utils import get_data_path, ensure_data_dirs  # ✅ env_utils統合
 from garllm.style_layer.response_modulator import modulate_response
 from garllm.utils.logger import get_logger
+from garllm.utils.llm_client import request_llm
+
 
 # ============================================================
 # GAR 環境パス設定
@@ -81,6 +83,10 @@ app = FastAPI(title="GAR-LLM Relay Server", version="1.2.0")
 # ============================================================
 # 補助関数群
 # ============================================================
+
+def _is_internal_prompt(message_text: str) -> bool:
+    patterns = ["### Task:", "### Chat History:", "### Output:", "### Guidelines:"]
+    return any(p in message_text for p in patterns)
 
 def _state_path_for(persona_name: str) -> str:
     """~/data/personas/state_<persona>.json を返す"""
@@ -203,8 +209,9 @@ def _run_context_update(persona_name: str, user_text: str, mode: str = "llm", de
        結果はstateファイルを読み直して使う。
     """
     state_file = _state_path_for(persona_name)
+    script_path = GAR_ROOT / "style_layer" / "context_controller.py"
     cmd = [
-        "python3", os.path.expanduser("~/modules/garllm/style_layer/context_controller.py"),
+        "python3", os.path.expanduser(script_path),
         "--persona", persona_name,
         "--input_text", user_text,
         "--mode", mode,
@@ -345,6 +352,37 @@ async def chat_completions(request: Request):
 
     # logger.debug(f"Received /v1/chat/completions request\n{req}")
 
+    cleaned_text = clean_messages(messages)
+    last_message = get_last_message(messages)
+    intensity = float(req.get("intensity", 0.8))
+    verbose = bool(req.get("verbose", False))
+
+    # --- OpenWebUIのフォローアップクエスチョンやタイトルなど内部メタタスクを検知した場合は、LLMへ直接パススルー ---
+    if _is_internal_prompt(last_message):
+        #logger.debug("Internal meta task detected — skipping response_modulator and passing through.")
+        # LLMへ直接パススルー
+        raw_response = request_llm(
+            messages=messages,  # オリジナルのまま
+            backend="auto",
+            temperature=0.7,
+            max_tokens=800,
+        )
+        return JSONResponse(
+            content={
+                "id": f"chatcmpl-{os.urandom(8).hex()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "gar-llm",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": raw_response},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
+            }
+        )
+
+
     # persona 指定を検出する
     persona_name = (
         req.get("persona")
@@ -353,19 +391,11 @@ async def chat_completions(request: Request):
         or "default"
     )
 
-    cleaned_text = clean_messages(messages)
-    last_message = get_last_message(messages)
-    intensity = float(req.get("intensity", 0.8))
-    verbose = bool(req.get("verbose", False))
-
     # gar.persona が新たに指定されていた場合のみ切り替え通知
     commands = extract_gar_commands(last_message)
     persona_cmds = [c for c in commands if c["cmd"] == "persona"]
 
-    # 🚫 OpenWebUI 内部タスクを検知してスキップ
-    is_internal_task = "### Task:" in last_message or "### Chat History:" in last_message
-
-    if persona_cmds and not is_internal_task and args.inject_system == "on":
+    if persona_cmds and args.inject_system == "on":
         already_injected = any(
             m.get("role") == "system" and persona_name in m.get("content", "")
             for m in messages

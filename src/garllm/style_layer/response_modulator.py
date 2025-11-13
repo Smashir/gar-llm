@@ -322,7 +322,7 @@ def modulate_response(
     persona_data = load_persona_profile(persona_name)
 
 
-    target_name = "ユーザ"
+    target_name = "user"
     if relations and isinstance(relations, dict):
         # 会話履歴に gar.persona: が含まれていれば対象ペルソナを抽出
         for m in reversed(text if isinstance(text, list) else []):
@@ -386,7 +386,7 @@ def modulate_response(
         messages_with_persona = [persona_system_message] + text
 
         if debug:
-            print("[DEBUG] persona_system_message]\n" + json.dumps(persona_system_message, ensure_ascii=False, indent=2))
+            print("[DEBUG] persona_system_message:\n" + json.dumps(persona_system_message, ensure_ascii=False, indent=2))
             print("[DEBUG] first_person candidates:", fp_list)
             print("[DEBUG] second_person candidates:", sp_list)
 

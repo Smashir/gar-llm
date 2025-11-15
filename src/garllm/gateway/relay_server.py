@@ -154,7 +154,7 @@ def _run_step(script_name: str, args: list[str]):
         return False
 
 
-    logger.info(f"Running {script_name} {' '.join(args)}", file=sys.stderr)
+    logger.info(f"Running {script_name} {' '.join(args)}")
 
     result = subprocess.run(["python3", str(script_path)] + args, capture_output=True, text=True)
     if result.returncode != 0:
@@ -165,7 +165,7 @@ def _run_step(script_name: str, args: list[str]):
 
 def _auto_generate_persona(persona_name: str) -> bool:
     """retriever → cleaner → condenser → semantic_condenser → thought_profiler → persona_generator を順次起動"""
-    logger.info(f"Persona '{persona_name}' not found, auto-generation triggered.", file=sys.stderr)
+    logger.info(f"Persona '{persona_name}' not found, auto-generation triggered.")
 
     steps = [
         ("retriever.py", ["--query", persona_name, "--output", str(RETRIEVED_DIR / f"retrieved_{persona_name}.json")]),
@@ -184,15 +184,15 @@ def _auto_generate_persona(persona_name: str) -> bool:
 
     for script, args in steps:
         if not _run_step(script, args):
-            logger.error(f"Persona generation failed at step: {script}", file=sys.stderr)
+            logger.error(f"Persona generation failed at step: {script}")
             return False
 
     persona_path = PERSONA_DIR / f"persona_{persona_name}.json"
     if persona_path.exists():
-        logger.info(f"Persona successfully generated: {persona_name}", file=sys.stderr)
+        logger.info(f"Persona successfully generated: {persona_name}")
         return True
     else:
-        logger.error(f"Persona file not found after generation: {persona_path}", file=sys.stderr)
+        logger.error(f"Persona file not found after generation: {persona_path}")
         return False
 
 
@@ -250,7 +250,7 @@ def _run_style_modulator(persona_name: str, text: str, intensity: float, verbose
 
     result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"style_modulator failed:\n{result.stderr}", file=sys.stderr)
+        logger.error(f"style_modulator failed:\n{result.stderr}")
         return text
 
     if "==== Rewritten Text ====" in result.stdout:

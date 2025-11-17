@@ -30,6 +30,14 @@ import sys
 
 from garllm.utils.llm_client import request_llm
 from garllm.utils.env_utils import get_data_path
+from garllm.utils.logger import get_logger
+
+# ==========================================
+# Utility
+# ==========================================
+
+# ロガー初期化
+logger = get_logger("response_modulator", level="INFO")
 
 # ============================================================
 # 📂 Persona Profile Loader
@@ -51,8 +59,114 @@ def load_persona_profile(persona_name: str) -> Dict[str, Any]:
             persona_data["expression_bank"] = json.load(f)
     return persona_data
 
+# ============================================================
+# 🎭 Expression Injector（表現辞書統合レイヤ）
+# ============================================================
+import random
 
-# === これを response_modulator.py の上部ユーティリティ群の近くに追加 ===
+def _collect_expression_refs(persona_data: dict, phase_name: str | None):
+    """
+    persona_data["expression_bank"] と phase 情報から、
+    利用対象となる (category, key) の組を集約する。
+    - phase.expression_refs に書かれている "cat.key"
+    - phase.description 内に書かれた "cat.key"
+    """
+    bank = persona_data.get("expression_bank") or {}
+    refs: set[tuple[str, str]] = set()
+
+    if not bank or not phase_name:
+        return bank, refs
+
+    phases = persona_data.get("phases") or {}
+    phase = phases.get(phase_name) or {}
+
+    # 1) 明示的な expression_refs
+    for ref in phase.get("expression_refs", []):
+        if not isinstance(ref, str):
+            continue
+        if "." not in ref:
+            continue
+        cat, key = ref.split(".", 1)
+        sub = bank.get(cat)
+        if isinstance(sub, dict) and key in sub:
+            refs.add((cat, key))
+
+    # 2) description 内の "cat.key"
+    desc = phase.get("description", "")
+    if isinstance(desc, str) and desc:
+        found = re.findall(r"([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)", desc)
+        for cat, key in found:
+            sub = bank.get(cat)
+            if isinstance(sub, dict) and key in sub:
+                refs.add((cat, key))
+
+    return bank, refs
+
+
+def extract_expression_snippets(persona_data: dict, phase_name: str | None = None) -> str:
+    """
+    persona_data["expression_bank"] を読み込み、
+    対象 phase で利用されるカテゴリからランダムサンプルを生成する。
+
+    - phase_name があれば、その phase に関連するカテゴリから抽出
+    - それも無ければ expression_bank 全体からフォールバック
+    """
+    bank, refs = _collect_expression_refs(persona_data, phase_name)
+    if not bank:
+        return ""
+
+    samples: list[str] = []
+
+    if refs:
+        # 指定カテゴリから抽出
+        for (cat, key) in refs:
+            sub = bank.get(cat, {})
+            if isinstance(sub, dict):
+                lst = sub.get(key)
+                if isinstance(lst, list) and lst:
+                    samples.append(random.choice(lst))
+    else:
+        # フォールバック：全カテゴリからランダム抽出
+        flat: list[str] = []
+        for cat, sub in bank.items():
+            if isinstance(sub, dict):
+                for key, lst in sub.items():
+                    if isinstance(lst, list):
+                        flat.extend(lst)
+        if flat:
+            samples.append(random.choice(flat))
+
+    if not samples:
+        return ""
+
+    joined = " / ".join(samples[:3])
+    return f"【表現ヒントサンプル】{joined}"
+
+
+def build_expression_instruction(persona_data: dict, phase_name: str | None = None) -> str:
+    """
+    相に紐づく expression の使い方を、LLM 向けの「操作ルール」として文章化する。
+
+    - 実際の類語生成や即興造語は LLM に任せる。
+    - ここでは「どのカテゴリを素材にし、どう再構成すべきか」を指示する。
+    """
+    bank, refs = _collect_expression_refs(persona_data, phase_name)
+    if not bank or not refs:
+        return ""
+
+    persona_label = persona_data.get("persona_name") or "ペルソナ"
+    lines: list[str] = []
+    lines.append("【相に基づく表現操作ルール】")
+    lines.append("・以下の expression カテゴリは、元の文をそのままコピペするのではなく、意味とノリを保ちながら、類義語・言い換え・語尾変形・カタカナ化・即興造語などで再構成してよい。")
+    lines.append("・カテゴリ内のフレーズは「素材」として扱い、複数を組み合わせたり部分的に変形して、新しいセリフや歌詞を作ること。")
+
+    for (cat, key) in sorted(refs):
+        lines.append(f"・{cat}.{key} : expression_{persona_label}.json 内のフレーズ群を素材として利用せよ。")
+
+    return "\n".join(lines)
+
+
+
 def build_pronoun_guidance(persona_data: Dict[str, Any], relations: Dict[str, Dict[str, float]] | None) -> str:
     """候補リストをそのまま提示し、候補外の使用禁止と選択規則を明記する。"""
     style = persona_data.get("style", {})
@@ -188,6 +302,68 @@ def axes_to_hints(axes: Dict[str, float] | None, converter) -> str:
     hints = [converter(k, v) for k, v in axes.items() if isinstance(v, (int, float))]
     return " ".join([h for h in hints if h])
 
+
+# ============================================================
+# 🧭 Phase Selector（相の選択）
+# ============================================================
+def select_active_phase(persona_name: str, persona_data: Dict[str, Any]) -> tuple[str | None, str, Dict[str, Any]]:
+    """
+    現在有効な「相（phase）」を決定する。
+
+    優先順位:
+      1. state_<persona_name>.json の "dominant_phase"
+      2. state_<persona_name>.json の "phase_weights" 最大値
+      3. persona の "基本相"
+      4. persona["phases"] の先頭
+    """
+    phases = persona_data.get("phases") or {}
+    if not phases:
+        return None, "", {}
+
+    phase_name: str | None = None
+    phase_cfg: Dict[str, Any] = {}
+
+    # 1 / 2. state_<persona>.json を見る
+    try:
+        state_path = Path(get_data_path("personas")) / f"state_{persona_name}.json"
+        if state_path.exists():
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            dom = state.get("dominant_phase")
+            if isinstance(dom, str) and dom in phases:
+                phase_name = dom
+            else:
+                weights = state.get("phase_weights") or {}
+                if isinstance(weights, dict):
+                    candidates: list[tuple[str, float]] = []
+                    for name in phases.keys():
+                        w = weights.get(name)
+                        if isinstance(w, (int, float)):
+                            candidates.append((name, float(w)))
+                    if candidates:
+                        candidates.sort(key=lambda x: x[1], reverse=True)
+                        phase_name = candidates[0][0]
+    except Exception:
+        # state が壊れていても落ちないようにする
+        phase_name = None
+
+    # 3. "基本相" があれば優先
+    if phase_name is None and "基本相" in phases:
+        phase_name = "基本相"
+
+    # 4. それでもなければ最初のキー
+    if phase_name is None:
+        phase_name = next(iter(phases.keys()))
+
+    phase_cfg = phases.get(phase_name, {}) or {}
+    desc = phase_cfg.get("description", "")
+    if not isinstance(desc, str):
+        desc = ""
+
+    return phase_name, desc, phase_cfg
+
+
 # --- 👇この関数を上部ユーティリティ群の近くに追加 ---
 def extract_relation_axes_for_target(relations: dict, target_name: str) -> dict | None:
     """relations から特定の target_name の軸を抽出"""
@@ -199,7 +375,227 @@ def extract_relation_axes_for_target(relations: dict, target_name: str) -> dict 
     return None
 
 # ============================================================
-# 🧠 Prompt Construction（ここを「応答生成」に変更）
+# 🧮 Phase Fusion（相の重ね合わせ）
+# ============================================================
+def load_phase_weights(persona_name: str, persona_data: Dict[str, Any]) -> dict[str, float]:
+    """
+    state_<persona>.json の phase_weights を読み込み、
+    なければ persona["phases"] を一様分布で初期化する。
+    """
+    phases = persona_data.get("phases") or {}
+    weights: dict[str, float] = {}
+
+    if not phases:
+        return {}
+
+    # state から読む
+    try:
+        state_path = Path(get_data_path("personas")) / f"state_{persona_name}.json"
+        if state_path.exists():
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            raw = state.get("phase_weights") or {}
+            if isinstance(raw, dict):
+                for name, v in raw.items():
+                    if name in phases and isinstance(v, (int, float)):
+                        weights[name] = float(v)
+    except Exception:
+        weights = {}
+
+    # 何も取れなかったら一様
+    if not weights:
+        n = len(phases)
+        if n > 0:
+            w = 1.0 / n
+            weights = {name: w for name in phases.keys()}
+
+    # 正規化
+    total = sum(weights.values())
+    if total > 0:
+        weights = {k: v / total for k, v in weights.items()}
+    return weights
+
+
+def fuse_phase_config(persona_data: Dict[str, Any], phase_weights: dict[str, float]) -> Dict[str, Any]:
+    """
+    phase_weights（合計 1.0）に基づき、全相の情報を重ね合わせる。
+
+    戻り値:
+      {
+        "description": 相ごとの説明を重み付きでまとめたテキスト,
+        "expression_refs": 重み付き優先度順の expression 参照リスト,
+        "style_bias": 相ごとの style_bias の重み付き合成,
+        "emotion_bias": 相ごとの emotion_bias の重み付き合成,
+      }
+    """
+    phases = persona_data.get("phases") or {}
+    if not phases or not phase_weights:
+        return {"description": "", "expression_refs": [], "style_bias": {}, "emotion_bias": {}}
+
+    desc_chunks: list[str] = []
+    expr_weight_map: dict[str, float] = {}
+    fused_style: dict[str, float] = {}
+    fused_emotion: dict[str, float] = {}
+
+    for name, cfg in phases.items():
+        w = phase_weights.get(name)
+        if not isinstance(w, (int, float)) or w <= 0:
+            continue
+
+        # 説明
+        desc = cfg.get("description")
+        if isinstance(desc, str) and desc.strip():
+            desc_chunks.append(f"【{name}（重み {w:.2f}）】{desc.strip()}")
+
+        # style_bias
+        sb = cfg.get("style_bias") or {}
+        if isinstance(sb, dict):
+            for k, v in sb.items():
+                if isinstance(v, (int, float)):
+                    fused_style[k] = fused_style.get(k, 0.0) + w * float(v)
+
+        # emotion_bias
+        eb = cfg.get("emotion_bias") or {}
+        if isinstance(eb, dict):
+            for k, v in eb.items():
+                if isinstance(v, (int, float)):
+                    fused_emotion[k] = fused_emotion.get(k, 0.0) + w * float(v)
+
+        # expression_refs
+        for ref in cfg.get("expression_refs", []):
+            if isinstance(ref, str):
+                expr_weight_map[ref] = expr_weight_map.get(ref, 0.0) + w
+
+    # 優先度順に並べた expression_refs
+    sorted_refs = sorted(expr_weight_map.items(), key=lambda x: x[1], reverse=True)
+    fused_refs = [r for r, _ in sorted_refs]
+
+    fused_desc = "\n".join(desc_chunks)
+
+    return {
+        "description": fused_desc,
+        "expression_refs": fused_refs,
+        "style_bias": fused_style,
+        "emotion_bias": fused_emotion,
+    }
+
+
+# ============================================================
+# 🧬 Core Profile Summary + Style Profile LLM
+# ============================================================
+def summarize_core_profile(persona_data: Dict[str, Any]) -> str:
+    """
+    core_profile から、応答LLMに渡すための簡潔な日本語サマリを作る。
+    """
+    core = persona_data.get("core_profile") or {}
+    lines: list[str] = []
+
+    summary = core.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(f"・概要: {summary.strip()}")
+
+    values = core.get("values")
+    if isinstance(values, list) and values:
+        vs = " / ".join(str(v) for v in values)
+        lines.append(f"・価値観: {vs}")
+
+    reasoning = core.get("reasoning_pattern")
+    if isinstance(reasoning, str) and reasoning.strip():
+        lines.append(f"・思考パターン: {reasoning.strip()}")
+
+    speech = core.get("speech_pattern")
+    if isinstance(speech, str) and speech.strip():
+        lines.append(f"・話し方の傾向: {speech.strip()}")
+
+    return "\n".join(lines) if lines else "（概要情報なし）"
+
+
+def build_style_profile_with_llm(
+    persona_name: str,
+    persona_data: Dict[str, Any],
+    phase_fusion: Dict[str, Any],
+    relation_axes: Dict[str, float] | None = None,
+    emotion_axes: Dict[str, float] | None = None,
+) -> str:
+    """
+    相の重畳結果 + persona 基本情報 + 関係軸 + 感情軸 + expression をまとめ、
+    「応答LLMに渡すための話法・スタイル指針テキスト」を LLM に生成させる。
+    """
+
+    core_summary = summarize_core_profile(persona_data)
+    style = persona_data.get("style", {})
+    first_person = style.get("first_person", []) or ["私"]
+    second_person = style.get("second_person", []) or ["あなた"]
+    keywords = style.get("keywords", []) or []
+
+    # 関係性・感情軸のテキスト
+    rel_hint = synthesize_relation_hint(relation_axes) if relation_axes else "（指定なし）"
+    emo_hint = generate_emotion_prompt(emotion_axes) if emotion_axes else "（指定なし）"
+
+    # expression カテゴリ一覧（重畳後）
+    expr_refs = phase_fusion.get("expression_refs") or []
+    expr_lines = [f"- {ref}" for ref in expr_refs] if expr_refs else ["（特に指定なし）"]
+    expr_block = "\n".join(expr_lines)
+
+    fused_style_bias = phase_fusion.get("style_bias") or {}
+    fused_emotion_bias = phase_fusion.get("emotion_bias") or {}
+    fused_desc = phase_fusion.get("description") or "（相の説明なし）"
+
+    prompt = f"""
+あなたは「ペルソナ話法設計アシスタント」です。
+目的は、以下の情報をもとに、LLM が『{persona_name}』として発話するための
+一貫した「話法・スタイル指針」を日本語でまとめることです。
+
+この指針は、別の応答生成用 LLM に system プロンプトとして渡されます。
+出力はそのまま貼り付けて使えるように、純粋な日本語テキストのみで記述してください（JSONは禁止）。
+
+【ペルソナ名】
+{persona_name}
+
+【コアプロファイル要約】
+{core_summary}
+
+【基本スタイル情報】
+・一人称候補: {', '.join(first_person)}
+・二人称候補: {', '.join(second_person)}
+・キーワード例: {', '.join(keywords) if keywords else "（未指定）"}
+
+【相（フェーズ）の重畳情報】
+{fused_desc}
+
+【相ベースのスタイルバイアス（合成済み）】
+{json.dumps(fused_style_bias, ensure_ascii=False)}
+
+【相ベースの感情バイアス（合成済み）】
+{json.dumps(fused_emotion_bias, ensure_ascii=False)}
+
+【関係性ヒント（ユーザ⇄ペルソナ）】
+{rel_hint}
+
+【感情ヒント】
+{emo_hint}
+
+【利用可能な表現カテゴリ（expression の参照）】
+{expr_block}
+
+【出力要件】
+- 箇条書きまたは短い段落で、以下を必ず含めてください:
+  - 口調（丁寧さ、威圧/柔らかさ、テンション）
+  - 語彙傾向（古風さ、カタカナ語の多さ、比喩の使い方など）
+  - リズム・文長（短文主体か、長文か、間の取り方など）
+  - 効果音・歌・ノリの使い方（あれば）
+  - expression カテゴリの利用方針（フレーズをそのまま使うのではなく、類語・語尾変形・即興造語の素材として使うこと）
+- 文脈によって揺らぎが生まれるような話法の方向性を示し、
+  固定フレーズではなく「揺らぎを持つスタイル」を定義してください。
+- 出力は JSON ではなく、日本語の説明文のみとします。
+"""
+    style_profile = ask_llm(prompt)
+    return style_profile.strip() if style_profile else ""
+
+
+
+# ============================================================
+# 🧠 Prompt Construction（応答生成用プロンプト構築）
 # ============================================================
 def build_prompt(
     input_text: str,
@@ -209,52 +605,85 @@ def build_prompt(
     verbose: bool = False,
     relation_axes: Dict[str, float] | None = None,
     relations: Dict[str, Dict[str, float]] | None = None,
-    emotion_axes: Dict[str, float] | None = None
+    emotion_axes: Dict[str, float] | None = None,
+    style_profile: str | None = None,
 ):
-    """ユーザー発話に対する『ペルソナとしての応答』を生成するプロンプトを構築。"""
+    """
+    ユーザー発話に対する『ペルソナとしての応答』を生成するプロンプトを構築。
+    相・expression の詳細は style_profile（別LLMの出力）に織り込まれている前提。
+    """
     style = persona_data.get("style", {})
     knowledge = persona_data.get("knowledge_anchors") or persona_data.get("core_profile", {}).get("knowledge_anchors", [])
-    tone = persona_data.get("style_guide") or persona_data.get("expression_prompt") or ""
 
     # 人称ガイダンス（候補提示＋候補外禁止）
     pronoun_guidance = build_pronoun_guidance(persona_data, relations)
 
-    # 冗長さガイド
+    # 冗長さガイド（今は説明テキストにだけ使う）
     expressiveness = (
-        "簡潔で要点を押さえた一段落の応答を出力してください。"
-        if not verbose else
-        "豊かな表現で1〜3段落の応答を出力してください（過度な水増しは避ける）。"
+        "簡潔に1〜2文で答える。" if not verbose
+        else "丁寧かつ饒舌に、2〜4文程度で情景や心情も補って答える。"
     )
 
-    # 関係性ヒント
-    relation_hint = synthesize_relation_hint(relation_axes)
-    # 他ペルソナとの関係
-    if relations and isinstance(relations, dict):
-        others_hint = []
+    # 関係性ヒント（ユーザ⇄persona）
+    relation_hint = synthesize_relation_hint(relation_axes) if relation_axes else ""
+
+    # 他ペルソナとの関係（あれば）
+    relation_context = ""
+    if relations:
+        others = []
         for target, axes in relations.items():
             if target in ["ユーザ", "ユーザー", "User", "user"]:
                 continue
             desc = synthesize_relation_hint(axes)
-            if desc and desc != "（指定なし）":
-                others_hint.append(f"{target}: {desc}")
-        relation_context = " / ".join(others_hint) if others_hint else "（他ペルソナとの関係なし）"
+            if desc:
+                others.append(f"{target}: {desc}")
+        if others:
+            relation_context = " / ".join(others)
+        else:
+            relation_context = "（指定なし）"
     else:
-        relation_context = "（他ペルソナとの関係なし）"
+        relation_context = "（指定なし）"
 
     # 感情ヒント
     emotion_hint_text = generate_emotion_prompt(emotion_axes) if emotion_axes else "（指定なし）"
+
+    # core_profile 要約
+    core_summary = summarize_core_profile(persona_data)
+
+    # knowledge anchors（必要ならそのまま渡す）
+    knowledge_lines = []
+    if isinstance(knowledge, list):
+        for k in knowledge:
+            if isinstance(k, dict):
+                label = k.get("label") or k.get("type") or ""
+                ref = k.get("reference") or k.get("significance") or ""
+                if label or ref:
+                    knowledge_lines.append(f"- {label}: {ref}")
+    knowledge_block = "\n".join(knowledge_lines) if knowledge_lines else "（特記なし）"
+
+    style_profile_text = style_profile or "（話法・スタイル指針は別途定義されているものとする）"
 
     # プロンプト
     prompt = f"""
 あなたは今から完全に『{persona_name}』として応答します。
 口調・語彙・価値観・判断基準は {persona_name} のものを厳守してください。
 {pronoun_guidance}
-文体指針: {tone if tone else "（特記なし）"}
+
+【ペルソナの基本情報】
+{core_summary}
+
+【話法・スタイル指針（相・expression・関係性・感情を統合したもの）】
+{style_profile_text}
+
 スタイル強度: {intensity * 100:.0f}%
 他者との関係: {relation_hint if relation_hint else "（指定なし）"}
 他ペルソナとの関係: {relation_context}
-感情指針: {emotion_hint_text if emotion_hint_text else "（指定なし）"}
+{emotion_hint_text if emotion_hint_text else "感情指針: （指定なし）"}
 関係性や感情指針の内容は、応答の語彙・口調・態度・話法に必ず反映させること。
+{expressiveness}
+
+【ペルソナ固有の知識アンカー（過去の出来事など）】
+{knowledge_block}
 
 【ユーザー発話】 
 {input_text}
@@ -263,11 +692,13 @@ def build_prompt(
 - 出力は**あなた（{persona_name}）としての応答文のみ**。説明・前置き・メタ記述は禁止。
 - 人称は上記候補からのみ選択し、一貫して用いる。候補外の人称は使用禁止。
 - 質問返しは避け、まずは**答え**を返す（必要なら最後に1件だけ簡潔な問い返し可）。
-- 日本語で書く。古風な文語調や歴史口調は、候補と関係性指針が示す場合のみ許容。
+- 日本語で書く。
 
 【出力】
 """.strip()
     return prompt
+
+
 
 
 # ============================================================
@@ -283,7 +714,7 @@ def ask_llm(prompt: str) -> str:
         cleaned = re.split(r"---+", response, maxsplit=1)[0].strip()
         return cleaned
     except Exception as e:
-        print(f"[response_modulator] LLM error: {e}")
+        logger.error(f"[response_modulator] LLM error: {e}")
         return ""
 
 # ============================================================
@@ -299,7 +730,7 @@ def ask_llm_chat(messages: list[dict[str, str]]) -> str:
         cleaned = re.split(r"---+", response, maxsplit=1)[0].strip()
         return cleaned
     except Exception as e:
-        print(f"[response_modulator] Chat LLM error: {e}")
+        logger.error(f"[response_modulator] Chat LLM error: {e}")
         return ""
 
 # ============================================================
@@ -312,39 +743,54 @@ def modulate_response(
     verbose: bool = False,
     debug: bool = False,
     relation_axes: dict[str, float] | None = None,
-    relations: dict[str, dict[str, float]] | None = None,  # ←この1行を追加
+    relations: dict[str, dict[str, float]] | None = None,  # ← relay_server から渡される複数関係
     emotion_axes: dict[str, float] | None = None
 ):
     """
     text が str なら従来どおり build_prompt() を使う。
     text が list (messages形式) なら Chat形式で LLM を呼び出す。
+
+    構造:
+      1. persona/state/relations/emotion から「相の重畳」を計算
+      2. スタイル設計用 LLM で「話法・スタイル指針」を生成
+      3. 応答生成LLMに、上記スタイル指針＋会話履歴/ユーザ入力を渡す
     """
     persona_data = load_persona_profile(persona_name)
 
-
-    target_name = "user"
+    # relations からユーザ対象の軸だけを抽出（あれば）
     if relations and isinstance(relations, dict):
-        # 会話履歴に gar.persona: が含まれていれば対象ペルソナを抽出
-        for m in reversed(text if isinstance(text, list) else []):
-            if m.get("role") == "user" and "gar.persona:" in m.get("content", ""):
-                try:
-                    target_name = m["content"].split("gar.persona:")[1].split(")")[0].strip()
-                    break
-                except Exception:
-                    pass
+        # "ユーザ/ユーザー/User/user" を優先
+        target_name = None
+        for cand in ["ユーザ", "ユーザー", "User", "user"]:
+            if cand in relations:
+                target_name = cand
+                break
+        if target_name:
+            relation_axes = extract_relation_axes_for_target(relations, target_name)
 
-    # 対象ペルソナ（ユーザ or 他ペルソナ）の関係軸を抽出
-    relation_axes = extract_relation_axes_for_target(relations, target_name)
+    # --- 相の重畳 ---
+    phase_weights = load_phase_weights(persona_name, persona_data)
+    phase_fusion = fuse_phase_config(persona_data, phase_weights)
 
+    # --- スタイル・話法プロファイルの生成（prompt生成LLM） ---
+    style_profile = build_style_profile_with_llm(
+        persona_name=persona_name,
+        persona_data=persona_data,
+        phase_fusion=phase_fusion,
+        relation_axes=relation_axes,
+        emotion_axes=emotion_axes,
+    )
+
+    logger.debug(f"phase_weights:{json.dumps(phase_weights, ensure_ascii=False)}")
+    logger.debug(f"phase_fusion:{json.dumps(phase_fusion, ensure_ascii=False)}")
+    logger.debug(f"style_profile:\n{style_profile}")
 
     # Chat形式の場合（relay_server 経由など）
     if isinstance(text, list):
-        if debug:
-            print("[DEBUG] Chat-mode messages input detected")
-            print(json.dumps(text, ensure_ascii=False, indent=2))
+        logger.debug("Chat-mode messages input detected")
+        logger.debug(json.dumps(text, ensure_ascii=False, indent=2))
 
         style = persona_data.get("style", {})
-        tone  = persona_data.get("style_guide") or persona_data.get("expression_prompt") or ""
         # 人称候補
         fp_list = style.get("first_person", []) or ["私"]
         sp_list = style.get("second_person", []) or ["あなた"]
@@ -364,44 +810,58 @@ def modulate_response(
                 desc = synthesize_relation_hint(axes)
                 if desc and desc != "（指定なし）":
                     others_hint.append(f"{target}: {desc}")
-            rel_others_hint = " / ".join(others_hint) if others_hint else "（他ペルソナとの関係なし）"
+            rel_others_hint = " / ".join(others_hint) if others_hint else "（指定なし）"
         else:
-            rel_others_hint = "（他ペルソナとの関係なし）"
+            rel_others_hint = "（指定なし）"
 
+        # 感情ヒント
         emo_hint = generate_emotion_prompt(emotion_axes) if emotion_axes else "（指定なし）"
+
+        core_summary = summarize_core_profile(persona_data)
 
         persona_system_message = {
             "role": "system",
             "content": (
                 f"あなたは今から完全に『{persona_name}』として応答します。\n"
-                f"{pronoun_guidance}\n"
-                f"文体指針: {tone if tone else '（特記なし）'} / スタイル強度: {intensity*100:.0f}%\n"
+                f"{pronoun_guidance}\n\n"
+                f"【ペルソナの基本情報】\n{core_summary}\n\n"
+                f"【話法・スタイル指針（相・expression・関係性・感情を統合したもの）】\n"
+                f"{style_profile}\n\n"
+                f"スタイル強度: {intensity*100:.0f}%\n"
                 f"関係性（ユーザ⇄{persona_name}）: {rel_user_hint}\n"
                 f"他ペルソナとの関係: {rel_others_hint}\n"
-                f"感情指針: {emo_hint}\n"
+                f"{emo_hint}\n"
                 f"出力は応答文のみ。メタ発言禁止。"
             )
         }
 
         messages_with_persona = [persona_system_message] + text
 
-        if debug:
-            print("[DEBUG] persona_system_message:\n" + json.dumps(persona_system_message, ensure_ascii=False, indent=2))
-            print("[DEBUG] first_person candidates:", fp_list)
-            print("[DEBUG] second_person candidates:", sp_list)
+        logger.debug(f"persona_system_message:\n{json.dumps(persona_system_message, ensure_ascii=False, indent=2)}")
+        logger.debug(f"first_person candidates:{fp_list}")
+        logger.debug(f"second_person candidates:{sp_list}")
 
         response = ask_llm_chat(messages_with_persona)
         return response.strip() if response else ""
 
+    # テキストモード（旧 CLI 互換）
+    prompt = build_prompt(
+        input_text=text,
+        persona_name=persona_name,
+        persona_data=persona_data,
+        intensity=intensity,
+        verbose=verbose,
+        relation_axes=relation_axes,
+        relations=relations,
+        emotion_axes=emotion_axes,
+        style_profile=style_profile,
+    )
 
-    # 従来のテキストモード
-    prompt = build_prompt(text, persona_name, persona_data, intensity, verbose, relation_axes, relations, emotion_axes)
-
-    if debug:
-        print("[DEBUG prompt]\n" + prompt + "\n" + "=" * 80)
+    logger.debug(f"generated prompt\n {prompt} \n {"=" * 80}")
 
     response = ask_llm(prompt)
     return response.strip() if response else text  # フォールバック: 応答失敗時は原文を返す
+
 
 
 # ============================================================
@@ -425,10 +885,19 @@ def main():
                         help="関係性ベクトル（JSON: {'Friendship':0.5,'Respect':-0.2} など）")
     parser.add_argument("--emotion_axes", type=str, default=None,
                         help="感情ベクトル（JSON: {'Joy':0.8,'Fear':-0.3} など）")
-    parser.add_argument("--debug", action="store_true", help="デバッグ表示（プロンプト出力）")
     parser.add_argument("--relations", type=str, default=None, help="関係性構造（JSON: {'ユーザ': {...}, '徳川家康': {...}}）")
+    parser.add_argument("--debug", action="store_true", help="デバッグ表示（プロンプト出力）")
+    parser.add_argument("--log-console", action="store_true", help="ログをコンソールにも出力")    
 
     args = parser.parse_args()
+
+    # ------------------------------
+    # ロガー設定（--debug で制御）
+    # ------------------------------
+    global logger
+    log_level = "DEBUG" if args.debug else "INFO"
+    logger = get_logger("response_modulator", level=log_level, to_console=args.log_console)
+    logger.info(f"Response modulation log_level={log_level})")
 
     relation_axes = json.loads(args.relation_axes) if args.relation_axes else None
     relations = json.loads(args.relations) if args.relations else None
@@ -439,9 +908,9 @@ def main():
         relation_axes, relations, 
         emotion_axes)
 
-    print("\n==== Rewritten Text ====")
-    print(rewritten)
-    print("=" * 80)
+    logger.debug("\n==== Rewritten Text ====")
+    logger.debug(rewritten)
+    logger.debug("=" * 80)
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,7 @@
 # Ghost Assimilation Relay (GAR)
 
+[**under construction**]
+
 > Persona-driven orchestration framework for modular LLM reasoning and adaptive style control.
 
 ---
@@ -12,16 +14,46 @@ persona-based reasoning, context condensation, and style modulation across multi
 - Persona layer for semantic and emotional modulation
 - Context layer for memory condensation and relevance filtering
 - Gateway relay for multi-agent orchestration
-- WebUI integration (Docker-based OpenWebUI)
-- Systemd templates for deployment
+
 
 ---
 
 ## 🧩 Directory Layout
-modules/
-  garllm/
-systemd_units/
-webui/
+```
+/home/<user>
+    └── 📁 gar-llm
+        ├── 📄 .git
+        ├── 📄 .gitignore
+        ├── 📄 CITATION.cff
+        ├── 📄 LICENSE
+        ├── 📄 NOTICE
+        ├── 📄 README.md
+        ├── 📄 pyproject.toml
+        └── 📁 src
+            └── 📁 garllm
+                ├── 📄 __init__.py
+                ├── 📁 context_layer
+                │   ├── 📄 cleaner.py
+                │   ├── 📄 condenser.py
+                │   ├── 📄 retriever.py
+                │   ├── 📄 semantic_condenser.py
+                │   └── 📄 thought_profiler.py
+                ├── 📁 gateway
+                │   └── 📄 relay_server.py
+                ├── 📁 persona_layer
+                │   └── 📄 persona_generator.py
+                ├── 📁 style_layer
+                │   ├── 📄 context_controller.py
+                │   ├── 📄 response_modulator.py
+                │   ├── 📄 style_modulator.py
+                │   └── 📄 test_emotions.sh
+                └── 📁 utils
+                    ├── 📄 env_utils.py
+                    ├── 📄 llm_client.py
+                    ├── 📄 logger.py
+                    └── 📄 vllm_client.py
+
+```
 
 ---
 

@@ -47,7 +47,7 @@ from garllm.utils.logger import get_logger
 # ==========================================
 
 # ロガー初期化
-logger = get_logger("context_controller", level="DEBUG")
+logger = get_logger("context_controller", level="INFO", to_console=False)
 
 
 def _get_state_path(persona_name: str) -> str:

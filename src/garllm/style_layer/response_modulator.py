@@ -37,7 +37,7 @@ from garllm.utils.logger import get_logger
 # ==========================================
 
 # ロガー初期化
-logger = get_logger("response_modulator", level="INFO")
+logger = get_logger("response_modulator", level="INFO", to_console=False)
 
 # ============================================================
 # 📂 Persona Profile Loader
@@ -589,7 +589,13 @@ def build_style_profile_with_llm(
   固定フレーズではなく「揺らぎを持つスタイル」を定義してください。
 - 出力は JSON ではなく、日本語の説明文のみとします。
 """
-    style_profile = ask_llm(prompt)
+
+    logger.debug(f"Style profile generation prompt for persona '{persona_name}':\n{prompt}")
+
+    style_profile = ask_llm(prompt=prompt, temperature=0.3, max_tokens=2096)
+
+    logger.debug(f"Generated style profile for persona '{persona_name}':\n{style_profile}")
+
     return style_profile.strip() if style_profile else ""
 
 
@@ -704,30 +710,22 @@ def build_prompt(
 # ============================================================
 # 💬 LLM Interface with Output Cleaner
 # ============================================================
-def ask_llm(prompt: str) -> str:
-    """
-    LLM 呼び出し。--- 以降の補足説明を除去する簡易クリーナ付き。
-    """
-    try:
-        response = request_llm(prompt=prompt, backend="auto", temperature=0.6, max_tokens=800)
-        # --- 補足説明（--- 以降）を削除 ---
-        cleaned = re.split(r"---+", response, maxsplit=1)[0].strip()
-        return cleaned
-    except Exception as e:
-        logger.error(f"[response_modulator] LLM error: {e}")
-        return ""
+def ask_llm(prompt: str, temperature=0.6, max_tokens=800) -> str:
+    return ask_llm_chat([{"role": "user", "content": prompt}])
+
 
 # ============================================================
 # 💬 Chat形式 LLM Interface（新規追加）
 # ============================================================
-def ask_llm_chat(messages: list[dict[str, str]]) -> str:
+def ask_llm_chat(messages: list[dict[str, str]],temperature=0.6, max_tokens=800) -> str:
     """
     Chat形式 (messages[]) 入力対応版。
     OpenWebUI や relay_server から直接 messages を受け取る場合に使用。
     """
     try:
-        response = request_llm(messages=messages, backend="auto", temperature=0.6, max_tokens=800)
-        cleaned = re.split(r"---+", response, maxsplit=1)[0].strip()
+        response = request_llm(messages=messages, backend="auto", temperature=temperature, max_tokens=max_tokens)
+        # cleaned = re.split(r"---+", response, maxsplit=1)[0].strip()
+        cleaned = response.strip()
         return cleaned
     except Exception as e:
         logger.error(f"[response_modulator] Chat LLM error: {e}")
@@ -741,10 +739,11 @@ def modulate_response(
     persona_name: str,
     intensity: float = 0.7,
     verbose: bool = False,
-    debug: bool = False,
     relation_axes: dict[str, float] | None = None,
     relations: dict[str, dict[str, float]] | None = None,  # ← relay_server から渡される複数関係
-    emotion_axes: dict[str, float] | None = None
+    emotion_axes: dict[str, float] | None = None,
+    debug: bool = False,
+    log_console: bool = False
 ):
     """
     text が str なら従来どおり build_prompt() を使う。
@@ -755,6 +754,27 @@ def modulate_response(
       2. スタイル設計用 LLM で「話法・スタイル指針」を生成
       3. 応答生成LLMに、上記スタイル指針＋会話履歴/ユーザ入力を渡す
     """
+
+    # logger instance は既に存在している想定
+    '''
+    if debug:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+
+    # console handler の追加（必要なら）
+    if log_console:
+        if not any(isinstance(h, logging.StreamHandler) and h.stream == sys.stdout for h in logger.handlers):
+            console = logging.StreamHandler(sys.stdout)
+            console.setFormatter(logger.handlers[0].formatter)
+            logger.addHandler(console)
+    '''
+    global logger
+
+    # 既存の logger がある場合でも level を更新する
+    log_level = "DEBUG" if debug else "INFO"
+    logger = get_logger("response_modulator", level=log_level, to_console=log_console)
+
     persona_data = load_persona_profile(persona_name)
 
     # relations からユーザ対象の軸だけを抽出（あれば）
@@ -904,9 +924,17 @@ def main():
     emotion_axes = json.loads(args.emotion_axes) if args.emotion_axes else None
 
     rewritten = modulate_response(
-        args.text, args.persona, args.intensity, args.verbose, args.debug, 
-        relation_axes, relations, 
-        emotion_axes)
+        text=args.text,
+        persona_name=args.persona,
+        intensity=args.intensity,
+        verbose=args.verbose,
+        relation_axes=relation_axes,
+        relations=relations,
+        emotion_axes=emotion_axes,
+        debug=args.debug,
+        log_console=args.log_console
+    )
+
 
     logger.debug("\n==== Rewritten Text ====")
     logger.debug(rewritten)

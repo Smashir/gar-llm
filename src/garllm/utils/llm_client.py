@@ -66,6 +66,7 @@ def request_llm(
     任意の LLM バックエンドにリクエストしてテキストを返す。
     - backend="auto" で自動判別
     - endpoint_type="auto" で messages/prompt に応じて切替
+    - endpoint=completions は legacy対応で原則使用しないこと、chat は messages 対応
     """
 
     backend = _detect_backend() if backend == "auto" else backend

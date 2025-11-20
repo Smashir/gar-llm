@@ -150,7 +150,7 @@ def _run_step(script_name: str, args: list[str]):
         script_path = GAR_ROOT / "context_layer" / script_name
         
     if not script_path.exists():
-        print(f"[WARN] Missing script: {script_path}")
+        logger.error(f"[WARN] Missing script: {script_path}")
         return False
 
 
@@ -223,11 +223,14 @@ def _run_context_update(persona_name: str, user_text: str, mode: str = "llm", de
     # emit_text はサーバー運用では絶対に付けない（stdoutが混ざる）
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    if debug and proc.stdout:
+    '''
+    if proc.stdout:
         # デバッグログとしては残してOK（JSONではないのでパースしない）
-        print("[context_controller stdout]", proc.stdout.strip())
+        logger.debug(f"[context_controller stdout] {proc.stdout.strip()}")
+    '''
     if proc.returncode != 0:
-        print("[WARN] context_controller non-zero exit:", proc.stderr.strip())
+        logger.error(f"[WARN] context_controller non-zero exit: {proc.stderr.strip()}")
+
     return _load_state(persona_name)
     
 
@@ -417,7 +420,7 @@ async def chat_completions(request: Request):
         HANDSHAKE_TIMEOUT = int(os.getenv("GAR_PERSONA_HANDSHAKE_TIMEOUT", "10"))
 
         if ENABLE_PERSONA_HANDSHAKE:
-            print(f"[HANDSHAKE] Starting persona stabilization handshake for '{persona_name}'", file=sys.stderr)
+            logger.info(f"[HANDSHAKE] Starting persona stabilization handshake for '{persona_name}'")
             handshake_messages = messages.copy()
             if handshake_messages and handshake_messages[-1].get("role") == "system":
                 handshake_messages.append({
@@ -444,18 +447,19 @@ async def chat_completions(request: Request):
                         persona_name=persona_name,
                         intensity=float(intensity),
                         verbose=False,
-                        debug=False,
                         relations=None,
                         emotion_axes=None,
+                        debug=args.debug,
+                        log_console=args.log_console
                     )
                 )
                 handshake_response = await asyncio.wait_for(task, timeout=HANDSHAKE_TIMEOUT)
-                print(f"[HANDSHAKE] Response: {handshake_response[:80]!r}", file=sys.stderr)
-                print(f"[HANDSHAKE] Persona '{persona_name}' stabilized.", file=sys.stderr)
+                logger.info(f"[HANDSHAKE] Response: {handshake_response[:80]!r}")
+                logger.info(f"[HANDSHAKE] Persona '{persona_name}' stabilized.")
             except asyncio.TimeoutError:
-                print(f"[HANDSHAKE] Timeout during persona stabilization for '{persona_name}'", file=sys.stderr)
+                logger.error(f"[HANDSHAKE] Timeout during persona stabilization for '{persona_name}'")
             except Exception as e:
-                print(f"[HANDSHAKE] Error during stabilization: {e}", file=sys.stderr)
+                logger.error(f"[HANDSHAKE] Error during stabilization: {e}")
 
     # personaが存在しなければ自動生成
     if not _ensure_persona_exists(persona_name):
@@ -483,9 +487,10 @@ async def chat_completions(request: Request):
         persona_name=persona_name,
         intensity=intensity,
         verbose=verbose,
-        debug=args.debug,
+        emotion_axes=emotion_axes,        
         relations=relations,
-        emotion_axes=emotion_axes
+        debug=args.debug,
+        log_console=args.log_console
     )
 
     keep_one = (args.prefix_persona == "on") and (persona_name and persona_name != "default")

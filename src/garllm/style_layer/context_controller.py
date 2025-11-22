@@ -75,12 +75,12 @@ def load_state(state_file: str) -> Dict:
         # relation_axes が残っていればユーザ関係にマイグレーション
         if "relation_axes" in state:
             user_rel = state.pop("relation_axes")
-            state.setdefault("relations", {})["ユーザ"] = user_rel
+            state.setdefault("relations", {})["user"] = user_rel
         return state
     # 新規初期状態
     rel_axes = {k: 0.0 for k in ["Trust","Familiarity","Hostility","Dominance","Empathy","Instrumentality"]}
     emo_axes = {k: 0.0 for k in ["joy","trust","fear","surprise","sadness","disgust","anger","anticipation"]}
-    return {"relations":{"ユーザ":rel_axes},"emotion_axes":emo_axes,"phase_weights":{}}
+    return {"relations":{"user":rel_axes},"emotion_axes":emo_axes,"phase_weights":{}}
 
 
 def save_state(state_file: str, state: Dict):
@@ -156,7 +156,7 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False, s
     "joy": 値, "trust": 値, "fear": 値, "surprise": 値,
     "sadness": 値, "disgust": 値, "anger": 値, "anticipation": 値
   }},
-  "relationes": {{
+  "relations": {{
     "user": {{
       "Trust": 値, "Familiarity": 値, "Hostility": 値,
       "Dominance": 値, "Empathy": 値, "Instrumentality": 値
@@ -185,7 +185,7 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False, s
     try:
         raw = request_llm(
             backend="auto",
-            prompt=prompt,
+            messages=[{"role":"user","content": prompt}],
             temperature=0.25,
             max_tokens=600
         ).strip()
@@ -196,6 +196,12 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False, s
 
         # JSONブロック抽出（堅牢対応）
         m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw, re.DOTALL)
+        if not m:
+            m = re.search(r"\{[\s\S]*?\}", raw, re.DOTALL)
+
+        if not m:
+            raise ValueError("No JSON found")
+
         candidate = m.group(1) if m else re.search(r"\{[\s\S]*\}", raw, re.DOTALL).group(0)
         parsed = json.loads(candidate)
 
@@ -203,15 +209,41 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False, s
         emo = {k: clamp(float(parsed.get("emotion_axes", {}).get(k, 0.0))) for k in
                ["joy","trust","fear","surprise","sadness","disgust","anger","anticipation"]}
         rels = {}
-        # "relations" と "relationes" の両方を許容
-        rel_block = parsed.get("relations") or parsed.get("relationes") or {}
+
+        rel_block = parsed.get("relations") or {}
         for target, axes in rel_block.items():
             rels[target] = {a: clamp(float(v)) for a, v in axes.items()}
         return {"emotion_axes": emo, "relations": rels}
+
     except Exception as e:
+
         logger.error(f"LLM context analysis failed: {e}")
-        return {"emotion_axes": {k:0.0 for k in ["joy","trust","fear","surprise","sadness","disgust","anger","anticipation"]},
-                "relations": {}}
+
+        # ==== フォールバック ====
+        # 現在の state の構造を維持しつつ「差分は全部0」で返す
+        try:
+            current = load_emotion_state(persona_name)
+        except:
+            current = {"emotion_axes": {}, "relations": {}}
+
+        # emotion_axes（構造を維持して全て 0）
+        emo_axes = {
+            k: 0.0 for k in current.get("emotion_axes", {
+                "joy":0,"trust":0,"fear":0,"surprise":0,
+                "sadness":0,"disgust":0,"anger":0,"anticipation":0
+            }).keys()
+        }
+
+        # relations（構造を維持して全て 0）
+        rels = {}
+        for target, axes in current.get("relations", {}).items():
+            rels[target] = {k: 0.0 for k in axes.keys()}
+
+        return {
+            "emotion_axes": emo_axes,
+            "relations": rels
+        }
+
 
 
 # ==========================================
@@ -250,7 +282,8 @@ def softmax(values, temperature=0.5):
 
 
 def update_phase_weights(persona_file: str, state: Dict, delta: Dict,
-                         alpha=0.3, beta=0.2, gamma=0.05, temperature=0.4):
+                         alpha: float = 0.3, beta: float = 0.2,
+                         gamma: float = 0.05, temperature: float = 0.4) -> Dict:
     """
     personaファイル内のphase定義を参照し、
     Emotion/Relationの変化量に基づきsoft-argmaxでphase重みを更新する。
@@ -258,34 +291,86 @@ def update_phase_weights(persona_file: str, state: Dict, delta: Dict,
     # ペルソナ定義を読み込む
     with open(persona_file, "r", encoding="utf-8") as f:
         persona = json.load(f)
-    phases = persona.get("phases", {})
+
+    phases = persona.get("phases", {}) or {}
+
+    # ペルソナ固有の phase_dynamics があれば、デフォルト値を上書きして使う
+    phase_dyn = persona.get("phase_dynamics") or {}
+    try:
+        alpha = float(phase_dyn.get("alpha", alpha))
+        beta = float(phase_dyn.get("beta", beta))
+        gamma = float(phase_dyn.get("gamma", gamma))
+        temperature = float(phase_dyn.get("temperature", temperature))
+    except (TypeError, ValueError):
+        # 異常値が混じっていても落とさず、デフォルトパラメータで継続
+        pass
 
     # 既存の重みを取得または初期化
-    weights = state.get("phase_weights", {p: 1.0 / max(len(phases), 1) for p in phases})
+    weights = state.get("phase_weights")
+    if not isinstance(weights, dict) or not weights:
+        n = len(phases)
+        if n > 0:
+            w = 1.0 / n
+            weights = {name: w for name in phases.keys()}
+        else:
+            weights = {}
 
-    new_vals = {}
+    new_vals: Dict[str, float] = {}
+    rel_delta = delta.get("relations", {}) or {}
+    emo_delta = delta.get("emotion_axes", {}) or {}
+
     for name, info in phases.items():
-        w = weights.get(name, 0.0)
-        bias_r = info.get("style_bias", {})
-        bias_e = info.get("emotion_bias", {})
+        # 以前の重み（なければ 0）
+        w_raw = (weights or {}).get(name, 0.0)
+        w = float(w_raw) if isinstance(w_raw, (int, float)) else 0.0
 
-        # 関係・感情の変化量から寄与を算出
-        dr = sum(bias_r.get(k,0.0)*sum(v.get(k,0.0) for v in delta.get("relations",{}).values()) for k in bias_r)
-        de = sum(bias_e.get(k, 0.0) * delta["emotion_axes"].get(k, 0.0) for k in delta["emotion_axes"])
-        noise = random.uniform(-1, 1) * gamma
+        bias_r = info.get("style_bias") or {}
+        bias_e = info.get("emotion_bias") or {}
+        if not isinstance(bias_r, dict):
+            bias_r = {}
+        if not isinstance(bias_e, dict):
+            bias_e = {}
 
-        new_vals[name] = w + alpha * dr + beta * de + noise
+        # 関係の変化量から寄与を算出
+        dr_sum = 0.0
+        for k, coeff in bias_r.items():
+            if not isinstance(coeff, (int, float)):
+                continue
+            acc = 0.0
+            for axes in rel_delta.values():
+                if isinstance(axes, dict):
+                    v = axes.get(k)
+                    if isinstance(v, (int, float)):
+                        acc += float(v)
+            dr_sum += float(coeff) * acc
+
+        # 感情の変化量から寄与を算出
+        de_sum = 0.0
+        for k, coeff in bias_e.items():
+            if not isinstance(coeff, (int, float)):
+                continue
+            v = emo_delta.get(k)
+            if isinstance(v, (int, float)):
+                de_sum += float(coeff) * float(v)
+
+        # ランダム揺らぎ
+        noise = random.uniform(-1.0, 1.0) * gamma
+
+        new_vals[name] = w + alpha * dr_sum + beta * de_sum + noise
 
     # soft-argmax正規化
-    vals = list(new_vals.values())
-    normed = softmax(vals, temperature) if vals else []
-    new_weights = {k: v for k, v in zip(new_vals.keys(), normed)}
+    if new_vals:
+        vals = list(new_vals.values())
+        normed = softmax(vals, temperature)
+        new_weights = {k: v for k, v in zip(new_vals.keys(), normed)}
 
-    # 主相（dominant phase）
-    if new_weights:
+        # 主相（dominant phase）
         state["phase_weights"] = new_weights
-        state["dominant_phase"] = max(new_weights,key=new_weights.get)
+        state["dominant_phase"] = max(new_weights, key=new_weights.get)
+
+    # phases が定義されていない場合は state をそのまま返す
     return state
+
 
 # ==========================================
 # 応答生成（CLI検証用オプション）
@@ -325,7 +410,7 @@ def main():
     parser.add_argument("--input_text", required=True, help="入力発話テキスト")
     parser.add_argument("--state_file", default="./persona_state.json", help="状態保存ファイルのパス")
     parser.add_argument("--intensity", type=float, default=0.8, help="（CLI検証用）文体強調度(0.0-1.0)")
-    parser.add_argument("--mode", choices=["rule", "llm"], default="rule", help="解析モード（rule / llm）")
+    parser.add_argument("--mode", choices=["rule", "llm"], default="llm", help="解析モード（rule / llm）")
     parser.add_argument("--emit_text", action="store_true", help="※CLI検証用: 更新状態を用いて応答文も生成して表示する")
     parser.add_argument("--debug", action="store_true", help="デバッグ出力を有効化")
     parser.add_argument("--relations", type=str, help="JSON structure for relations override")
@@ -341,8 +426,19 @@ def main():
 
     logger.info(f"Context Controller started (mode={args.mode}, log_level={log_level})")
 
+    # ---------------------------------
+    # state ファイルパスの決定
+    #  - デフォルト値("./persona_state.json")のままなら
+    #    ペルソナごとの state_<persona>.json を使う
+    #  - 明示的に --state_file が指定されていればそれを優先
+    # ---------------------------------
+    if args.state_file and args.state_file != "./persona_state.json":
+        state_path = args.state_file
+    else:
+        state_path = _get_state_path(args.persona)
+
     # 現在状態をロード
-    state = load_state(args.state_file)
+    state = load_state(state_path)
 
     # CLI からの直接指定を反映
     if args.relations:
@@ -361,24 +457,29 @@ def main():
 
     # 文脈解析
     if args.mode == "llm":
-        delta = analyze_context_llm(args.input_text, debug=args.debug, show_prompt=args.debug)
+        # persona 名を渡すように修正（フォールバック時などの一貫性のため）
+        delta = analyze_context_llm(args.input_text, persona_name=args.persona, debug=args.debug, show_prompt=args.debug)
     else:
         delta = analyze_context_rule(args.input_text)
 
     # 状態更新 & 保存
     new_state = update_axes(state, delta)
-    persona_path = os.path.expanduser(f"~/data/personas/persona_{args.persona}.json")
+
+    # ペルソナ定義のパス（env_utils.get_data_path に揃える）
+    persona_path = str(Path(get_data_path("personas")) / f"persona_{args.persona}.json")
+
     updated_state = update_phase_weights(persona_path, new_state, delta)
-    save_state(args.state_file, updated_state)
+    save_state(state_path, updated_state)
 
     logger.debug(f"Δ Emotion/Relation: {json.dumps(delta, ensure_ascii=False, indent=2)}")
-    logger.debug(f"Updated State: {json.dumps(new_state, ensure_ascii=False, indent=2)}")
+    logger.debug(f"Updated State: {json.dumps(updated_state, ensure_ascii=False, indent=2)}")
 
     # CLI検証用
     if args.emit_text:
-        print(call_response_modulator(args.persona, args.input_text, new_state, args.intensity, args.debug))
+        print(call_response_modulator(args.persona, args.input_text, updated_state, args.intensity, args.debug))
 
 
 # After state update and file write
 if __name__ == "__main__":
     main()
+

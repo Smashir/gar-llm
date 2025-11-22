@@ -143,14 +143,81 @@ def extract_expression_snippets(persona_data: dict, phase_name: str | None = Non
     return f"【表現ヒントサンプル】{joined}"
 
 
-def build_expression_instruction(persona_data: dict, phase_name: str | None = None) -> str:
+def sample_expression_snippets_weighted(
+    persona_data: dict,
+    expression_refs: list[str] | None,
+    max_samples: int = 3,
+) -> list[str]:
+    """
+    フェーズ重畳によって得られた expression_refs に基づき、
+    expression_<persona>.json のカテゴリからサンプルを抽選する。
+    ・expression_refs が None or 空なら従来の extract_expression_snippets() にフォールバック。
+    ・expression_refs に重み情報は無いのでカテゴリ順で優先度を付けつつランダム揺らぎで抽出する。
+    ・カテゴリ内のフレーズは expression のままコピーせず、"素材" としてそのまま渡す。
+      （揺らぎづけはプロンプト生成用LLMが担当）
+    """
+
+    # フォールバック
+    if not expression_refs:
+        return extract_expression_snippets(persona_data, None)
+
+    expressions = persona_data.get("expression_bank") or {}
+    flat_list: list[str] = []
+
+    # ref を優先度順に処理していく
+    for ref in expression_refs:
+        # ref = "talk.intro" など
+        if "." not in ref:
+            continue
+        cat, key = ref.split(".", 1)
+        cat_block = expressions.get(cat)
+        if not isinstance(cat_block, dict):
+            continue
+        arr = cat_block.get(key)
+        if isinstance(arr, list):
+            # まずカテゴリ内全フレーズを素材として拾う
+            for item in arr:
+                if isinstance(item, str):
+                    flat_list.append(item)
+
+    if not flat_list:
+        return []
+
+    # ランダムに1〜max_samples 散らす
+    random.shuffle(flat_list)
+    return flat_list[:max_samples]
+
+
+def build_expression_instruction(
+    persona_data: dict,
+    phase_name: str | None = None,
+    expression_refs: list[str] | None = None,
+) -> str:
     """
     相に紐づく expression の使い方を、LLM 向けの「操作ルール」として文章化する。
 
     - 実際の類語生成や即興造語は LLM に任せる。
     - ここでは「どのカテゴリを素材にし、どう再構成すべきか」を指示する。
+    - phase_name か expression_refs のどちらか（または両方）を手掛かりに対象カテゴリを決める。
     """
-    bank, refs = _collect_expression_refs(persona_data, phase_name)
+    bank = persona_data.get("expression_bank") or {}
+    refs: set[tuple[str, str]] = set()
+
+    # 1) phase_name ベースの参照（従来の挙動）
+    if phase_name is not None:
+        _, phase_refs = _collect_expression_refs(persona_data, phase_name)
+        refs.update(phase_refs)
+
+    # 2) phase_fusion などから渡された expression_refs ("cat.key" 形式) ベースの参照
+    if expression_refs:
+        for ref in expression_refs:
+            if not isinstance(ref, str) or "." not in ref:
+                continue
+            cat, key = ref.split(".", 1)
+            sub = bank.get(cat)
+            if isinstance(sub, dict) and key in sub:
+                refs.add((cat, key))
+
     if not bank or not refs:
         return ""
 
@@ -159,11 +226,29 @@ def build_expression_instruction(persona_data: dict, phase_name: str | None = No
     lines.append("【相に基づく表現操作ルール】")
     lines.append("・以下の expression カテゴリは、元の文をそのままコピペするのではなく、意味とノリを保ちながら、類義語・言い換え・語尾変形・カタカナ化・即興造語などで再構成してよい。")
     lines.append("・カテゴリ内のフレーズは「素材」として扱い、複数を組み合わせたり部分的に変形して、新しいセリフや歌詞を作ること。")
+    lines.append("・サンプルとしていくつかのフレーズを示すが、そのまま固定文としてではなく、必ず少し揺らぎを加えて使うこと。")
 
     for (cat, key) in sorted(refs):
         lines.append(f"・{cat}.{key} : expression_{persona_label}.json 内のフレーズ群を素材として利用せよ。")
+        sub = bank.get(cat, {})
+        if not isinstance(sub, dict):
+            continue
+        lst = sub.get(key)
+        if not isinstance(lst, list) or not lst:
+            continue
+
+        # 例文を最大 2 件まで載せる（長すぎるとプロンプトが肥大化するため）
+        examples = [s for s in lst if isinstance(s, str) and s.strip()]
+        random.shuffle(examples)
+        for ex in examples[:2]:
+            ex_clean = ex.strip()
+            lines.append(
+                f"    - 例: 「{ex_clean}」のニュアンスを保ちつつ、"
+                f"語尾や言い回しを少し変形して使ってよい。"
+            )
 
     return "\n".join(lines)
+
 
 
 
@@ -518,29 +603,56 @@ def build_style_profile_with_llm(
     emotion_axes: Dict[str, float] | None = None,
 ) -> str:
     """
-    相の重畳結果 + persona 基本情報 + 関係軸 + 感情軸 + expression をまとめ、
-    「応答LLMに渡すための話法・スタイル指針テキスト」を LLM に生成させる。
+    相の重畳結果 + persona 基本情報 + 関係軸 + 感情軸 + expression をまとめて、
+    応答LLMに渡す「話法・スタイル指針テキスト」を LLM に生成させる。
+
+    ※ meta.styleNotes / song.chorus / talk.intro などの expression タグは
+       あくまで「内部タグ」としてだけ渡し、style_profile 本文には出させない。
     """
 
+    # --- 相の重畳結果から fused 情報を取り出す ---
+    fused_style_bias = phase_fusion.get("style_bias") or {}
+    fused_emotion_bias = phase_fusion.get("emotion_bias") or {}
+    fused_desc = (phase_fusion.get("description") or "").strip() or "（相の説明なし）"
+    expr_refs = phase_fusion.get("expression_refs") or []
+
+    # expression の "cat.key" をカテゴリ単位に圧縮（meta / song / talk など）
+    unique_cats: list[str] = []
+    if expr_refs:
+        cats = {
+            ref.split(".", 1)[0]
+            for ref in expr_refs
+            if isinstance(ref, str) and "." in ref
+        }
+        unique_cats = sorted(cats)
+
+    if unique_cats:
+        expr_block = "・" + "\n・".join(unique_cats)
+    else:
+        expr_block = "（指定なし）"
+
+    # --- expression_<persona>.json から代表的なフレーズをいくつかサンプルとして渡す ---
+    #   （プロンプト生成用 LLM には見せるが、応答生成用 LLM には style_profile テキストだけを渡す）
+    #expr_samples = extract_expression_snippets(persona_data, None)  # 全体から代表例を1〜3個サンプル
+    expr_samples = sample_expression_snippets_weighted(
+        persona_data,
+        phase_fusion.get("expression_refs"),
+        max_samples=3,
+    )
+
+
+    # --- persona 基本情報 ---
     core_summary = summarize_core_profile(persona_data)
     style = persona_data.get("style", {})
     first_person = style.get("first_person", []) or ["私"]
     second_person = style.get("second_person", []) or ["あなた"]
     keywords = style.get("keywords", []) or []
 
-    # 関係性・感情軸のテキスト
+    # --- 関係性・感情軸を自然文ヒントに変換 ---
     rel_hint = synthesize_relation_hint(relation_axes) if relation_axes else "（指定なし）"
-    emo_hint = generate_emotion_prompt(emotion_axes) if emotion_axes else "（指定なし）"
+    emo_hint = generate_emotion_prompt(emotion_axes) if emotion_axes else "感情指針: （指定なし）"
 
-    # expression カテゴリ一覧（重畳後）
-    expr_refs = phase_fusion.get("expression_refs") or []
-    expr_lines = [f"- {ref}" for ref in expr_refs] if expr_refs else ["（特に指定なし）"]
-    expr_block = "\n".join(expr_lines)
-
-    fused_style_bias = phase_fusion.get("style_bias") or {}
-    fused_emotion_bias = phase_fusion.get("emotion_bias") or {}
-    fused_desc = phase_fusion.get("description") or "（相の説明なし）"
-
+    # --- LLM 用プロンプト ---
     prompt = f"""
 あなたは「ペルソナ話法設計アシスタント」です。
 目的は、以下の情報をもとに、LLM が『{persona_name}』として発話するための
@@ -556,9 +668,9 @@ def build_style_profile_with_llm(
 {core_summary}
 
 【基本スタイル情報】
-・一人称候補: {', '.join(first_person)}
-・二人称候補: {', '.join(second_person)}
-・キーワード例: {', '.join(keywords) if keywords else "（未指定）"}
+・一人称候補: {", ".join(first_person)}
+・二人称候補: {", ".join(second_person)}
+・キーワード例: {", ".join(keywords) if keywords else "（未指定）"}
 
 【相（フェーズ）の重畳情報】
 {fused_desc}
@@ -575,30 +687,52 @@ def build_style_profile_with_llm(
 【感情ヒント】
 {emo_hint}
 
-【利用可能な表現カテゴリ（expression の参照）】
+【内部用の表現カテゴリタグ（expression の参照。出力には書かない）】
 {expr_block}
 
+【参考用 expression サンプル（このままコピペせず、ニュアンスだけを使うこと）】
+{expr_samples if expr_samples else "（特に指定なし）"}
+
+※上記のタグ名（meta / song / talk など）や cat.key 形式の識別子は、
+  「どの種類のフレーズを素材として使えるか」というヒントとしてだけ利用してください。
+  あなたが生成する話法・スタイル指針テキストには、
+  これらのタグ名・カテゴリ名（meta.styleNotes / song.chorus / talk.intro 等）や
+  cat.key 形式の文字列を一切含めないでください。
+※expression サンプルに含まれるフレーズも、そのまま繰り返さず、
+  意味とノリを保ちつつ、理解できる単語で言い換え・語尾変形・複数の要素の合成などで
+  「揺らぎを持った代表的な言い回し」として書いてください。
+
 【出力要件】
-- 箇条書きまたは短い段落で、以下を必ず含めてください:
+- 以下の各項目をすべて考慮し、箇条書きまたは短い段落でわかりやすい要件にまとめなさい:
   - 口調（丁寧さ、威圧/柔らかさ、テンション）
-  - 語彙傾向（古風さ、カタカナ語の多さ、比喩の使い方など）
+  - 語彙傾向（古語、現代語、カタカナ語、慣用表現、比喩の使い方など）
   - リズム・文長（短文主体か、長文か、間の取り方など）
-  - 効果音・歌・ノリの使い方（あれば）
-  - expression カテゴリの利用方針（フレーズをそのまま使うのではなく、類語・語尾変形・即興造語の素材として使うこと）
+  - 効果音・歌・ノリの使い方
+  - フレーズの使い方・揺らぎの付け方
+    （expression 由来のフレーズをそのまま列挙するのではなく、
+      類語・語尾変形・即興造語などの「使い方の方針」を説明すること）
+- 可能であれば、ペルソナらしさがよく出る代表的なセリフ・掛け声・歌い出しなどを
+  2〜5個程度、上記方針に従って**揺らぎを付けた形で**例示してよい。
+  （ただし expression サンプルの完全コピーは禁止）
 - 文脈によって揺らぎが生まれるような話法の方向性を示し、
   固定フレーズではなく「揺らぎを持つスタイル」を定義してください。
 - 出力は JSON ではなく、日本語の説明文のみとします。
 """
 
-    logger.debug(f"Style profile generation prompt for persona '{persona_name}':\n{prompt}")
+    logger.debug("Style profile generation prompt for persona '%s':\n%s", persona_name, prompt)
 
-    style_profile = ask_llm(prompt=prompt, temperature=0.3, max_tokens=2096)
+    style_profile = ask_llm(
+        prompt=prompt,
+        temperature=0.3,
+        max_tokens=2048,
+    )
 
-    logger.debug(f"Generated style profile for persona '{persona_name}':\n{style_profile}")
+    logger.debug("Generated style profile for persona '%s':\n%s", persona_name, style_profile)
 
-    return style_profile.strip() if style_profile else ""
+    style_profile = style_profile or ""
+    return style_profile.strip()
 
-
+    
 
 # ============================================================
 # 🧠 Prompt Construction（応答生成用プロンプト構築）
@@ -613,18 +747,22 @@ def build_prompt(
     relations: Dict[str, Dict[str, float]] | None = None,
     emotion_axes: Dict[str, float] | None = None,
     style_profile: str | None = None,
+    expression_instruction: str | None = None,
 ):
     """
     ユーザー発話に対する『ペルソナとしての応答』を生成するプロンプトを構築。
-    相・expression の詳細は style_profile（別LLMの出力）に織り込まれている前提。
+    相・expression の詳細は style_profile（別LLMの出力）と expression_instruction に織り込まれている前提。
     """
     style = persona_data.get("style", {})
-    knowledge = persona_data.get("knowledge_anchors") or persona_data.get("core_profile", {}).get("knowledge_anchors", [])
+    knowledge = (
+        persona_data.get("knowledge_anchors")
+        or persona_data.get("core_profile", {}).get("knowledge_anchors", [])
+    )
 
     # 人称ガイダンス（候補提示＋候補外禁止）
     pronoun_guidance = build_pronoun_guidance(persona_data, relations)
 
-    # 冗長さガイド（今は説明テキストにだけ使う）
+    # 冗長さガイド
     expressiveness = (
         "簡潔に1〜2文で答える。" if not verbose
         else "丁寧かつ饒舌に、2〜4文程度で情景や心情も補って答える。"
@@ -633,7 +771,7 @@ def build_prompt(
     # 関係性ヒント（ユーザ⇄persona）
     relation_hint = synthesize_relation_hint(relation_axes) if relation_axes else ""
 
-    # 他ペルソナとの関係（あれば）
+    # 他ペルソナとの関係
     relation_context = ""
     if relations:
         others = []
@@ -643,10 +781,7 @@ def build_prompt(
             desc = synthesize_relation_hint(axes)
             if desc:
                 others.append(f"{target}: {desc}")
-        if others:
-            relation_context = " / ".join(others)
-        else:
-            relation_context = "（指定なし）"
+        relation_context = " / ".join(others) if others else "（指定なし）"
     else:
         relation_context = "（指定なし）"
 
@@ -656,7 +791,7 @@ def build_prompt(
     # core_profile 要約
     core_summary = summarize_core_profile(persona_data)
 
-    # knowledge anchors（必要ならそのまま渡す）
+    # knowledge anchors
     knowledge_lines = []
     if isinstance(knowledge, list):
         for k in knowledge:
@@ -668,8 +803,9 @@ def build_prompt(
     knowledge_block = "\n".join(knowledge_lines) if knowledge_lines else "（特記なし）"
 
     style_profile_text = style_profile or "（話法・スタイル指針は別途定義されているものとする）"
+    expr_instruction_text = expression_instruction or "（expression 由来の特別な指針はない）"
 
-    # プロンプト
+    # プロンプト本体
     prompt = f"""
 あなたは今から完全に『{persona_name}』として応答します。
 口調・語彙・価値観・判断基準は {persona_name} のものを厳守してください。
@@ -680,6 +816,9 @@ def build_prompt(
 
 【話法・スタイル指針（相・expression・関係性・感情を統合したもの）】
 {style_profile_text}
+
+【expression 由来の表現操作ルール（内部ガイド）】
+{expr_instruction_text}
 
 スタイル強度: {intensity * 100:.0f}%
 他者との関係: {relation_hint if relation_hint else "（指定なし）"}
@@ -703,6 +842,7 @@ def build_prompt(
 【出力】
 """.strip()
     return prompt
+
 
 
 
@@ -801,9 +941,17 @@ def modulate_response(
         emotion_axes=emotion_axes,
     )
 
+    # --- expression 由来の表現操作ルール（expression_bank 利用） ---
+    expression_instruction = build_expression_instruction(
+        persona_data=persona_data,
+        phase_name=None,
+        expression_refs=phase_fusion.get("expression_refs"),
+    )
+
     logger.debug(f"phase_weights:{json.dumps(phase_weights, ensure_ascii=False)}")
     logger.debug(f"phase_fusion:{json.dumps(phase_fusion, ensure_ascii=False)}")
     logger.debug(f"style_profile:\n{style_profile}")
+
 
     # Chat形式の場合（relay_server 経由など）
     if isinstance(text, list):
@@ -847,6 +995,8 @@ def modulate_response(
                 f"【ペルソナの基本情報】\n{core_summary}\n\n"
                 f"【話法・スタイル指針（相・expression・関係性・感情を統合したもの）】\n"
                 f"{style_profile}\n\n"
+                f"【expression 由来の表現操作ルール（内部ガイド）】\n"
+                f"{expression_instruction or '（expression 由来の特別な指針はない）'}\n\n"
                 f"スタイル強度: {intensity*100:.0f}%\n"
                 f"関係性（ユーザ⇄{persona_name}）: {rel_user_hint}\n"
                 f"他ペルソナとの関係: {rel_others_hint}\n"
@@ -854,6 +1004,7 @@ def modulate_response(
                 f"出力は応答文のみ。メタ発言禁止。"
             )
         }
+
 
         messages_with_persona = [persona_system_message] + text
 
@@ -875,9 +1026,11 @@ def modulate_response(
         relations=relations,
         emotion_axes=emotion_axes,
         style_profile=style_profile,
+        expression_instruction=expression_instruction,
     )
 
-    logger.debug(f"generated prompt\n {prompt} \n {"=" * 80}")
+  
+    logger.debug("generated prompt\n%s\n%s", prompt, "=" * 80)
 
     response = ask_llm(prompt)
     return response.strip() if response else text  # フォールバック: 応答失敗時は原文を返す

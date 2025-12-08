@@ -366,16 +366,15 @@ def default_phase_dynamics():
 def extract_persona_profile(thought_data: Dict[str, Any], persona_name: str, debug=False) -> Dict[str, Any]:
     """思想＋スタイル＋相（phase）情報を統合してPersonaデータ生成"""
     summary = thought_data.get("summary", "")
+    background = thought_data.get("background", "")
     values = thought_data.get("values", [])
     reasoning_pattern = thought_data.get("reasoning_pattern", "")
     speech_pattern = thought_data.get("speech_pattern", "")
 
-    # === 既存処理 ===
     anchors = extract_anchors(persona_name, summary, debug)
     style = extract_style(persona_name, summary, debug)
     expression_prompt = extract_expression_prompt(persona_name, summary, style, debug)
 
-    # === 新規追加：Phase生成 ===
     phases = extract_phases(
         persona_name,
         summary,
@@ -393,6 +392,7 @@ def extract_persona_profile(thought_data: Dict[str, Any], persona_name: str, deb
 
         "core_profile": {
             "summary": summary,
+            "background": background,
             "values": values if isinstance(values, list) else [values],
             "reasoning_pattern": reasoning_pattern,
             "speech_pattern": speech_pattern,

@@ -102,6 +102,7 @@ def dialogue_extract(entries, persona, mode="completions"):
 
     qa = {
         "summary": f"{persona}の思想と価値観を200〜300字で要約してください。",
+        "background": f"{persona}の出身地を必ず書いてください。また経歴や人生経験の概要を説明してください。",
         "values": f"{persona}の価値観を3〜5語で具体化し、各々を簡潔に説明してください。",
         "reasoning_pattern": f"{persona}の思考や判断の傾向を述べ、どう行動する人物か説明してください。",
         "speech_pattern": f"{persona}の話し方や語彙の特徴を説明してください。"

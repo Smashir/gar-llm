@@ -268,6 +268,26 @@ async def health():
     return {"status": "ok", "time": time.time()}
 
 # ============================================================
+# OpenAI API 互換: モデル一覧
+# ============================================================
+@app.get("/v1/models")
+async def list_models():
+    """OpenAI API 互換用の /v1/models エンドポイント"""
+    now = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "gar-llm",      # OpenWebUI 上で表示されるモデルID
+                "object": "model",
+                "created": now,
+                "owned_by": "garllm",
+                "permission": [],
+            }
+        ],
+    }
+
+# ============================================================
 # GAR Command Parser (新仕様対応)
 # ============================================================
 

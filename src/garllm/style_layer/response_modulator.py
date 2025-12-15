@@ -151,41 +151,65 @@ def sample_expression_snippets_weighted(
     """
     フェーズ重畳によって得られた expression_refs に基づき、
     expression_<persona>.json のカテゴリからサンプルを抽選する。
+
+    対応パターン:
+      - "talk.intro" のような cat.key 形式
+      - "battle_cries" のようなドット無しキー（expression_bank[ref]）
+
     ・expression_refs が None or 空なら従来の extract_expression_snippets() にフォールバック。
-    ・expression_refs に重み情報は無いのでカテゴリ順で優先度を付けつつランダム揺らぎで抽出する。
     ・カテゴリ内のフレーズは expression のままコピーせず、"素材" としてそのまま渡す。
       （揺らぎづけはプロンプト生成用LLMが担当）
     """
-
-    # フォールバック
-    if not expression_refs:
-        return extract_expression_snippets(persona_data, None)
-
     expressions = persona_data.get("expression_bank") or {}
+    if not expressions:
+        return []
+
+    # フォールバック: refs が無い場合は旧ヘルパーを使う
+    if not expression_refs:
+        try:
+            snippet = extract_expression_snippets(persona_data, phase_name=None)
+        except Exception:
+            snippet = ""
+        return [snippet] if snippet else []
+
     flat_list: list[str] = []
 
-    # ref を優先度順に処理していく
     for ref in expression_refs:
-        # ref = "talk.intro" など
-        if "." not in ref:
+        if not isinstance(ref, str):
             continue
-        cat, key = ref.split(".", 1)
-        cat_block = expressions.get(cat)
-        if not isinstance(cat_block, dict):
+
+        # 1) "cat.key" 形式
+        if "." in ref:
+            cat, key = ref.split(".", 1)
+            sub = expressions.get(cat)
+            if isinstance(sub, dict):
+                arr = sub.get(key)
+                if isinstance(arr, list):
+                    for item in arr:
+                        if isinstance(item, str):
+                            flat_list.append(item)
             continue
-        arr = cat_block.get(key)
-        if isinstance(arr, list):
-            # まずカテゴリ内全フレーズを素材として拾う
-            for item in arr:
+
+        # 2) ドット無しキー → expression_bank[ref] を見る
+        val = expressions.get(ref)
+        if isinstance(val, list):
+            for item in val:
                 if isinstance(item, str):
                     flat_list.append(item)
+        elif isinstance(val, dict):
+            # サブカテゴリをすべてフラットに集約
+            for lst in val.values():
+                if isinstance(lst, list):
+                    for item in lst:
+                        if isinstance(item, str):
+                            flat_list.append(item)
 
     if not flat_list:
         return []
 
-    # ランダムに1〜max_samples 散らす
     random.shuffle(flat_list)
     return flat_list[:max_samples]
+
 
 
 def build_expression_instruction(
@@ -196,29 +220,63 @@ def build_expression_instruction(
     """
     相に紐づく expression の使い方を、LLM 向けの「操作ルール」として文章化する。
 
-    - 実際の類語生成や即興造語は LLM に任せる。
-    - ここでは「どのカテゴリを素材にし、どう再構成すべきか」を指示する。
-    - phase_name か expression_refs のどちらか（または両方）を手掛かりに対象カテゴリを決める。
+    対応パターン:
+      - "cat.key" 形式（例: "talk.intro"）
+      - "flat_key" 形式（例: "battle_cries"）
     """
     bank = persona_data.get("expression_bank") or {}
-    refs: set[tuple[str, str]] = set()
+    if not bank:
+        return ""
 
-    # 1) phase_name ベースの参照（従来の挙動）
+    pair_refs: set[tuple[str, str]] = set()  # ("cat","key")
+    flat_keys: set[str] = set()              # "battle_cries" など
+
+    # 1) phase_name ベースの参照（従来の挙動 + flat key 拡張）
     if phase_name is not None:
-        _, phase_refs = _collect_expression_refs(persona_data, phase_name)
-        refs.update(phase_refs)
+        try:
+            _, phase_pairs = _collect_expression_refs(persona_data, phase_name)
+            pair_refs.update(phase_pairs)
+        except Exception:
+            pass
 
-    # 2) phase_fusion などから渡された expression_refs ("cat.key" 形式) ベースの参照
+        phases = persona_data.get("phases") or {}
+        phase = phases.get(phase_name) or {}
+        for ref in phase.get("expression_refs", []):
+            if not isinstance(ref, str):
+                continue
+            if "." in ref:
+                cat, key = ref.split(".", 1)
+                pair_refs.add((cat, key))
+            else:
+                flat_keys.add(ref)
+
+    # 2) phase_fusion などから渡された expression_refs
     if expression_refs:
         for ref in expression_refs:
-            if not isinstance(ref, str) or "." not in ref:
+            if not isinstance(ref, str):
                 continue
-            cat, key = ref.split(".", 1)
-            sub = bank.get(cat)
-            if isinstance(sub, dict) and key in sub:
-                refs.add((cat, key))
+            if "." in ref:
+                cat, key = ref.split(".", 1)
+                pair_refs.add((cat, key))
+            else:
+                flat_keys.add(ref)
 
-    if not bank or not refs:
+    # 実在するカテゴリだけに絞り込む
+    valid_pairs: set[tuple[str, str]] = set()
+    for cat, key in pair_refs:
+        sub = bank.get(cat)
+        if isinstance(sub, dict) and key in sub:
+            valid_pairs.add((cat, key))
+    pair_refs = valid_pairs
+
+    valid_flat: set[str] = set()
+    for k in flat_keys:
+        val = bank.get(k)
+        if isinstance(val, (list, dict)):
+            valid_flat.add(k)
+    flat_keys = valid_flat
+
+    if not pair_refs and not flat_keys:
         return ""
 
     persona_label = persona_data.get("persona_name") or "ペルソナ"
@@ -228,7 +286,8 @@ def build_expression_instruction(
     lines.append("・カテゴリ内のフレーズは「素材」として扱い、複数を組み合わせたり部分的に変形して、新しいセリフや歌詞を作ること。")
     lines.append("・サンプルとしていくつかのフレーズを示すが、そのまま固定文としてではなく、必ず少し揺らぎを加えて使うこと。")
 
-    for (cat, key) in sorted(refs):
+    # まず cat.key 形式
+    for cat, key in sorted(pair_refs):
         lines.append(f"・{cat}.{key} : expression_{persona_label}.json 内のフレーズ群を素材として利用せよ。")
         sub = bank.get(cat, {})
         if not isinstance(sub, dict):
@@ -237,17 +296,38 @@ def build_expression_instruction(
         if not isinstance(lst, list) or not lst:
             continue
 
-        # 例文を最大 2 件まで載せる（長すぎるとプロンプトが肥大化するため）
         examples = [s for s in lst if isinstance(s, str) and s.strip()]
         random.shuffle(examples)
         for ex in examples[:2]:
             ex_clean = ex.strip()
             lines.append(
-                f"    - 例: 「{ex_clean}」のニュアンスを保ちつつ、"
-                f"語尾や言い回しを少し変形して使ってよい。"
+                f"    - 例(cat.{key}): 「{ex_clean}」のニュアンスを保ちつつ、語尾や言い回しを少し変形して使ってよい。"
+            )
+
+    # 次に flat key 形式
+    for k in sorted(flat_keys):
+        lines.append(f"・{k} : expression_{persona_label}.json 内のフレーズ群を素材として利用せよ。")
+        val = bank.get(k)
+        flat: list[str] = []
+        if isinstance(val, list):
+            flat.extend(s for s in val if isinstance(s, str) and s.strip())
+        elif isinstance(val, dict):
+            for lst in val.values():
+                if isinstance(lst, list):
+                    flat.extend(s for s in lst if isinstance(s, str) and s.strip())
+
+        if not flat:
+            continue
+
+        random.shuffle(flat)
+        for ex in flat[:2]:
+            ex_clean = ex.strip()
+            lines.append(
+                f"    - 例({k}): 「{ex_clean}」のニュアンスを保ちつつ、語尾や言い回しを少し変形して使ってよい。"
             )
 
     return "\n".join(lines)
+
 
 
 
@@ -498,6 +578,9 @@ def load_phase_weights(persona_name: str, persona_data: Dict[str, Any]) -> dict[
     total = sum(weights.values())
     if total > 0:
         weights = {k: v / total for k, v in weights.items()}
+
+    #logger.debug(f"phase_weights:{json.dumps(weights, ensure_ascii=False)}")
+
     return weights
 
 
@@ -557,12 +640,17 @@ def fuse_phase_config(persona_data: Dict[str, Any], phase_weights: dict[str, flo
 
     fused_desc = "\n".join(desc_chunks)
 
-    return {
+    phase_fusion = {
         "description": fused_desc,
         "expression_refs": fused_refs,
         "style_bias": fused_style,
         "emotion_bias": fused_emotion,
     }
+    #logger.debug(f"phase_fusion:{json.dumps(phase_fusion, ensure_ascii=False)}")    
+
+    return phase_fusion
+
+
 
 
 # ============================================================
@@ -591,6 +679,38 @@ def summarize_core_profile(persona_data: Dict[str, Any]) -> str:
     speech = core.get("speech_pattern")
     if isinstance(speech, str) and speech.strip():
         lines.append(f"・話し方の傾向: {speech.strip()}")
+
+    # 性別・年代などの属性
+    demographic = core.get("demographic")
+    if isinstance(demographic, dict):
+        gender = demographic.get("gender")
+        age_range = demographic.get("age_range")
+        parts = []
+        if isinstance(gender, str) and gender.strip() and gender.strip() != "不明":
+            parts.append(f"性別: {gender.strip()}")
+        if isinstance(age_range, str) and age_range.strip() and age_range.strip() != "不明":
+            parts.append(f"年代: {age_range.strip()}")
+        if parts:
+            lines.append("・属性: " + " / ".join(parts))
+
+    # 言語・なまり・口癖など
+    lang_prof = core.get("language_profile")
+    if isinstance(lang_prof, dict):
+        lparts = []
+        dialect = lang_prof.get("dialect")
+        if isinstance(dialect, str) and dialect.strip() and dialect.strip() != "不明":
+            lparts.append(f"方言・なまり: {dialect.strip()}")
+        speech_style = lang_prof.get("speech_style")
+        if isinstance(speech_style, str) and speech_style.strip():
+            lparts.append(f"話し方のスタイル: {speech_style.strip()}")
+        samples = lang_prof.get("sample_phrases")
+        if isinstance(samples, list) and samples:
+            sample_str = " / ".join(str(s) for s in samples[:3])
+            lparts.append(f"口癖・表現例: {sample_str}")
+        if lparts:
+            lines.append("・言語・口調: " + " / ".join(lparts))
+
+
 
     return "\n".join(lines) if lines else "（概要情報なし）"
 
@@ -719,7 +839,7 @@ def build_style_profile_with_llm(
 - 出力は JSON ではなく、日本語の説明文のみとします。
 """
 
-    logger.debug("Style profile generation prompt for persona '%s':\n%s", persona_name, prompt)
+    # logger.debug("Style profile generation prompt for persona '%s':\n%s", persona_name, prompt)
 
     style_profile = ask_llm(
         prompt=prompt,
@@ -727,9 +847,9 @@ def build_style_profile_with_llm(
         max_tokens=2048,
     )
 
-    logger.debug("Generated style profile for persona '%s':\n%s", persona_name, style_profile)
-
     style_profile = style_profile or ""
+    # logger.debug("Generated style profile for persona '%s':\n%s", persona_name, style_profile)
+
     return style_profile.strip()
 
     
@@ -948,10 +1068,6 @@ def modulate_response(
         expression_refs=phase_fusion.get("expression_refs"),
     )
 
-    logger.debug(f"phase_weights:{json.dumps(phase_weights, ensure_ascii=False)}")
-    logger.debug(f"phase_fusion:{json.dumps(phase_fusion, ensure_ascii=False)}")
-    logger.debug(f"style_profile:\n{style_profile}")
-
 
     # Chat形式の場合（relay_server 経由など）
     if isinstance(text, list):
@@ -1009,8 +1125,6 @@ def modulate_response(
         messages_with_persona = [persona_system_message] + text
 
         logger.debug(f"persona_system_message:\n{json.dumps(persona_system_message, ensure_ascii=False, indent=2)}")
-        logger.debug(f"first_person candidates:{fp_list}")
-        logger.debug(f"second_person candidates:{sp_list}")
 
         response = ask_llm_chat(messages_with_persona)
         return response.strip() if response else ""
@@ -1060,7 +1174,7 @@ def main():
                         help="感情ベクトル（JSON: {'Joy':0.8,'Fear':-0.3} など）")
     parser.add_argument("--relations", type=str, default=None, help="関係性構造（JSON: {'ユーザ': {...}, '徳川家康': {...}}）")
     parser.add_argument("--debug", action="store_true", help="デバッグ表示（プロンプト出力）")
-    parser.add_argument("--log-console", action="store_true", help="ログをコンソールにも出力")    
+    parser.add_argument("--log-console", action="store_true", help="ログをコンソールにも出力") 
 
     args = parser.parse_args()
 

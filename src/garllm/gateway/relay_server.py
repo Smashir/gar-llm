@@ -66,8 +66,6 @@ PERSONA_DIR = Path(get_data_path("personas"))
 THOUGHT_DIR = Path(get_data_path("thoughts"))
 SEMANTIC_DIR = Path(get_data_path("semantic"))
 RETRIEVED_DIR = Path(get_data_path("retrieved"))
-CLEANED_DIR = Path(get_data_path("cleaned"))
-CONDENSED_DIR = Path(get_data_path("condensed"))
 
 # ============================================================
 # ロガー設定（初期値はINFO、mainで上書き）
@@ -108,7 +106,7 @@ def _load_state(persona_name: str) -> dict:
     # からの初期（relationsはユーザのみで0埋め、emotion_axesは8軸0）
     rel_axes = {k: 0.0 for k in ["Trust","Familiarity","Hostility","Dominance","Empathy","Instrumentality"]}
     emo_axes = {k: 0.0 for k in ["joy","trust","fear","surprise","sadness","disgust","anger","anticipation"]}
-    return {"relations":{"ユーザ":rel_axes},"emotion_axes":emo_axes,"phase_weights":{}}
+    return {"relations":{"user":rel_axes},"emotion_axes":emo_axes,"phase_weights":{}}
 
 def _save_state(persona_name: str, state: dict) -> None:
     p = _state_path_for(persona_name)
@@ -164,22 +162,58 @@ def _run_step(script_name: str, args: list[str]):
 
 
 def _auto_generate_persona(persona_name: str) -> bool:
-    """retriever → cleaner → condenser → semantic_condenser → thought_profiler → persona_generator を順次起動"""
+    """retriever → semantic_condenser → thought_profiler → persona_generator を順次起動"""
     logger.info(f"Persona '{persona_name}' not found, auto-generation triggered.")
 
     steps = [
-        ("retriever.py", ["--query", persona_name, "--output", str(RETRIEVED_DIR / f"retrieved_{persona_name}.json")]),
-        ("cleaner.py", ["--input", str(RETRIEVED_DIR / f"retrieved_{persona_name}.json"),
-                        "--output", str(CLEANED_DIR / f"cleaned_{persona_name}.json")]),
-        ("condenser.py", ["--input", str(CLEANED_DIR / f"cleaned_{persona_name}.json"),
-                          "--output", str(CONDENSED_DIR / f"condensed_{persona_name}.json")]),
-        ("semantic_condenser.py", ["--input", str(CONDENSED_DIR / f"condensed_{persona_name}.json"),
-                                   "--output", str(SEMANTIC_DIR / f"semantic_{persona_name}.json")]),
-        ("thought_profiler.py", ["--input", str(SEMANTIC_DIR / f"semantic_{persona_name}.json"),
-                                 "--output", str(THOUGHT_DIR / f"thought_{persona_name}.json"),
-                                 "--persona", persona_name]),
-        ("persona_generator.py", ["--input", str(THOUGHT_DIR / f"thought_{persona_name}.json"),
-                                    "--persona", persona_name])
+        # retriever: 生情報取得＋clean_text生成（cleaned_*.json）
+        (
+            "retriever.py",
+            [
+                "--queries",
+                json.dumps(
+                    [
+                        persona_name,
+                        f"{persona_name} 性別",
+                        f"{persona_name} 話し方",
+                        f"{persona_name} 口調",
+                        f"{persona_name} 方言",
+                        f"{persona_name} なまり",
+                        f"{persona_name} キャラクター",
+                        f"{persona_name} 自己紹介",
+                    ],
+                    ensure_ascii=False
+                ),
+                "--output", str(RETRIEVED_DIR / f"retrieved_{persona_name}.json"),
+                "--limit", "15",
+            ],
+        ),
+        # semantic_condenser: 人物要約（summary）生成（semantic_*.json）
+        (
+            "semantic_condenser.py",
+            [
+                "--input", str(RETRIEVED_DIR / f"retrieved_{persona_name}.json"),
+                "--persona", persona_name,
+                "--output", str(SEMANTIC_DIR / f"semantic_{persona_name}.json"),
+            ],
+        ),
+        # thought_profiler: episodes / anchors / core_profile 生成
+        (
+            "thought_profiler.py",
+            [
+                "--input", str(SEMANTIC_DIR / f"semantic_{persona_name}.json"),
+                "--output", str(THOUGHT_DIR / f"thought_{persona_name}.json"),
+                "--persona", persona_name,
+            ],
+        ),
+        # persona_generator: 最終 persona_*.json 生成
+        (
+            "persona_generator.py",
+            [
+                "--input", str(THOUGHT_DIR / f"thought_{persona_name}.json"),
+                "--persona", persona_name,
+            ],
+        ),
     ]
 
     for script, args in steps:
@@ -194,6 +228,7 @@ def _auto_generate_persona(persona_name: str) -> bool:
     else:
         logger.error(f"Persona file not found after generation: {persona_path}")
         return False
+
 
 
 def _ensure_persona_exists(persona_name: str):

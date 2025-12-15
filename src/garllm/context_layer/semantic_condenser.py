@@ -1,172 +1,217 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-semantic_condenser.py — GAR Context Layer: Semantic Condenser (persona-agnostic)
--------------------------------------------------------------------------------
-Cleaner/Condenser の出力（記事やテキストの配列 JSON）から本文を抽出し、
-LLM（vLLM/OpenAI互換）で要約を生成・収集する“意味抽出”専用スクリプト。
+GAR Semantic Condenser（condenser統合版）
 
-※ persona は不要です。人物固有の抽出は persona_assimilator 側の責務です。
+【役割】
+- retriever（cleaner統合済）が生成した "description" を入力として受け取る。
+- LLM による意味要約（summary）を生成する。
+- LLM が失敗した場合は簡易バックアップ要約（元 condenser）を使う。
+- condenser.py は廃止され、このファイルのみが意味抽出レイヤとなる。
 
-使い方:
-  python3 semantic_condenser.py --input /path/to/condensed_*.json \
-                                [--mode chat|completions] \
-                                [--output /path/to/semantic_*.json]
+【入力】
+[
+  {
+    "title": "...",
+    "url": "...",
+    "description": "本文テキスト..."
+  },
+  ...
+]
 
-- --input  : Condenser の出力 JSON（配列）を指定
-- --mode   : LLM エンドポイント種別（既定: completions）
-- --output : 出力先（未指定なら ~/data/semantic/semantic_<推定名>.json）
+【出力】
+[
+  {
+    "title": "...",
+    "url": "...",
+    "summary": "意味要約（LLM or fallback）"
+  },
+  ...
+]
 """
 
-import os
-import sys
-import re
 import json
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List
+import re
 
-# sys.path.append(os.path.expanduser("~/modules/gar-llm/src/"))
-
-# 内部ユーティリティ
+from garllm.utils.llm_client import request_llm
 from garllm.utils.env_utils import get_data_path
-from garllm.utils.llm_client import request_llm as request_openai
-
-# ---- 抽出用キー定義 ---------------------------------------------------------
-PRIMARY_TEXT_KEYS = [
-    "clean_text", "content", "text", "body", "snippet", "description", "article",
-    "raw_text", "summary"
-]
 
 
-LIST_TEXT_KEYS = ["texts", "chunks", "paragraphs"]
+# ============================================================
+# Fallback: 簡易要約（旧 condenser.py より統合）
+# ============================================================
 
-def extract_text(entry: Dict[str, Any]) -> str:
-    """辞書から本文らしき最初の値を抽出。無ければ空文字を返す。"""
-    for k in PRIMARY_TEXT_KEYS:
-        v = entry.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    for k in LIST_TEXT_KEYS:
-        v = entry.get(k)
-        if isinstance(v, list) and v:
-            joined = "\n".join(str(x) for x in v if str(x).strip())
-            if joined.strip():
-                return joined.strip()
-    return ""
+def naive_summarize(text: str, ratio: float = 0.2, max_sentences: int = 5):
+    """
+    LLM が失敗した際に使用する単純なバックアップ要約。
+    - 文を句読点で分割
+    - 出現単語の頻度でスコアリング
+    - 上位 max_sentences 件を連結
+    """
+    if not text:
+        return ""
 
-def summarize(text: str, title: str = "", mode: str = "completions") -> str:
-    """LLM で 100〜200 文字の要約を生成。"""
+    sentences = re.split(r'(?<=[。！？])', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 0]
+
+    if not sentences:
+        return ""
+
+    words = re.findall(r'\w+', text)
+    freq = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+
+    scored = []
+    for s in sentences:
+        score = sum(freq.get(w, 0) for w in re.findall(r'\w+', s))
+        scored.append((score, s))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    selected = [s for _, s in scored[:max_sentences]]
+
+    return " ".join(selected)
+
+
+def llm_summarize(text: str, title: str = "") -> str:
+    """
+    description を人物中心の意味要約に変換する。
+
+    ねらい:
+      - 後段の thought_profiler / persona_generator が、
+        「この資料はこの人物について何を言っているか」を
+        ひと目で分かるようにする。
+    """
     if not text or len(text.strip()) < 10:
         return ""
-    prompt = (
-        "以下の記事内容を100〜200文字で要約してください。"
-        "固有名詞・日時・制度名などの重要情報は保持し、冗長な表現は避けてください。\n"
-        f"タイトル: {title}\n本文:\n----\n{text[:4000]}\n----\n要約:"
-    )
+
+    clipped = text[:4000]
+
+    prompt = f"""
+以下は、ある人物に関するウェブ記事の本文です。
+この人物についての情報だけに焦点を当てて、120〜200文字程度の日本語で要約してください。
+
+【要約に必ず含めること】
+- その人物が「何者か」（職業・役割・分野など）
+- 活躍した時代や期間（本文に記載がある場合のみ）
+- 主な功績・活動・出来事（代表的なものを2〜3個）
+- 関連する固有名詞（人名・組織名・地名・作品名などの重要なもの）
+
+【省くべきこと】
+- ウェブサイトの案内文や注意書き
+- 「この記事では〜を紹介します」などメタな説明
+- 広告・メニュー・フッターなど本文以外の情報
+
+【スタイル】
+- 三人称の説明文で書く（です・ます調でもだ・である調でもよい）
+- 箇条書きは使わず、1〜2文の連続した文章にする
+- 「この文章では〜」などのメタ発言はしない
+
+【文化的背景として含めるべき事項】
+- 出身地（市町村・都道府県）
+- 育った地域（分かれば）
+- 主な活動地域（国内外）
+- 使用言語（日本語・英語など）
+- 国際的な背景（移住・外国籍など）
+
+【注意】
+- 出身地から具体的な方言を決めつけない。
+  （例：大阪府出身だから「大阪弁」と断言しない）
+- 文化的背景は、後段の人格生成が参照する “候補情報” としてまとめる。
+
+タイトル: {title}
+
+本文:
+----
+{clipped}
+----
+人物についての要約:
+"""
+
     try:
-        if mode == "chat":
-            return (request_openai(messages=[{"role": "user", "content": prompt}],
-                                   endpoint_type="chat") or "").strip()
-        else:
-            return (request_openai(prompt=prompt, endpoint_type="completions") or "").strip()
+        res = request_llm(
+            messages=[
+                {"role": "system", "content": "あなたは人物情報に特化した日本語要約アシスタントです。"},
+                {"role": "user", "content": prompt}
+            ],
+            endpoint_type="chat",
+            max_tokens=320,
+            temperature=0.2,
+        )
+        summary = (res or "").strip()
+        if summary:
+            return summary
     except Exception as e:
-        print(f"[ERROR summarize] {e}")
-        return ""
+        print(f"[semantic_condenser] LLM要約失敗: {e}")
 
-def infer_semantic_path(input_path: Path) -> Path:
-    """
-    出力パス未指定時の既定パスを推定:
-      ~/data/semantic/semantic_<name>.json
-    - 入力ファイル名が condensed_<name>.json → <name> を再利用
-    - それ以外は stem を使う
-    """
-    base_dir = Path(get_data_path("semantic"))
-    base_dir.mkdir(parents=True, exist_ok=True)
-    stem = input_path.stem  # 例) condensed_徳川家康
-    m = re.match(r"condensed_(.+)", stem)
-    name = m.group(1) if m else stem
-    # スラッシュ等を安全化
-    safe = re.sub(r"[^\w\-\u3040-\u30FF\u4E00-\u9FFF]+", "_", name)
-    return base_dir / f"semantic_{safe}.json"
+    # LLMが落ちた場合のフェイルセーフ（旧 condenser 相当）
+    return naive_summarize(text)
 
-def save_results(data: List[Dict[str, Any]], output_path: Path) -> Path:
-    """結果を JSON 保存。"""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"[INFO] Saved {len(data)} entries -> {output_path}")
-    return output_path
 
-def run_semantic_condense(input_path: str, output_path: str | None = None, mode: str = "completions"):
-    infile = Path(input_path)
-    if not infile.exists():
-        print(f"[ERROR] Input not found: {infile}")
-        sys.exit(1)
+# ============================================================
+# MAIN PROCESSOR
+# ============================================================
 
-    # 出力ファイル名の既定を決定
-    out_path = Path(output_path) if output_path else infer_semantic_path(infile)
+def process_items(items):
+    processed = []
 
-    # 入力読み込み（配列想定）
-    try:
-        data: List[Dict[str, Any]] = json.loads(infile.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[ERROR] Failed to load JSON: {e}")
-        sys.exit(1)
+    for entry in items:
+        title = entry.get("title", "")
+        url = entry.get("url", "")
+        description = entry.get("description", "")
 
-    out: List[Dict[str, Any]] = []
-    total = len(data) if isinstance(data, list) else 0
-    ok = 0
-    skipped = 0
+        summary = llm_summarize(description, title=title)
 
-    for idx, entry in enumerate(data, 1):
-        if not isinstance(entry, dict):
-            skipped += 1
-            continue
-        title = (entry.get("title") or "").strip()
-        url = entry.get("url") or ""
-        source = entry.get("source") or ""
-
-        text = extract_text(entry)
-        if not text:
-            print(f"⚠️ Skip(no-text) [{idx}/{total}]: {title or url}")
-            skipped += 1
-            continue
-
-        summary = summarize(text, title, mode)
-        if not summary:
-            print(f"⚠️ Skip(empty-summary) [{idx}/{total}]: {title or url}")
-            skipped += 1
-            continue
-
-        out.append({
+        processed.append({
             "title": title,
-            "summary": summary,
-            "source": source,
-            "url": url
+            "url": url,
+            "summary": summary
         })
-        ok += 1
 
-    save_results(out, out_path)
-    print(f"✅ Semantic condensation complete: {ok}/{total} (skipped={skipped})")
+    return processed
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="GAR Context Layer: Semantic Condenser (persona-agnostic)",
-        epilog=(
-            "例:\n"
-            "  python3 semantic_condenser.py --input ~/data/condensed/condensed_徳川家康.json\n"
-            "  python3 semantic_condenser.py --input ~/data/condensed/condensed_記事.json --mode chat\n"
-            "  python3 semantic_condenser.py --input ./condensed_x.json --output ./semantic_x.json"
-        ),
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument("--input", type=str, required=True, help="Condenser出力のJSONファイル（配列）")
-    parser.add_argument("--mode", choices=["chat", "completions"], default="completions",
-                        help="使用するエンドポイントモード（既定: completions）")
-    parser.add_argument("--output", type=str, default=None, help="出力JSONパス（任意）")
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+def save_results(data, name: str, output_path: str | None = None) -> Path:
+    if output_path:
+        path = Path(output_path)
+    else:
+        base = Path(get_data_path("semantic"))
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"semantic_{name}.json"
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    print(f"[semantic_condenser] 保存: {path}")
+    return path
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="GAR Semantic Condenser（condenser統合版）")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--persona", required=True)
+    parser.add_argument("--output", type=str)
     args = parser.parse_args()
 
-    print("=== Context Layer: Semantic Condenser ===")
-    run_semantic_condense(args.input, args.output, args.mode)
+    print(f"[semantic_condenser] Loading: {args.input}")
+    with open(args.input, "r", encoding="utf-8") as f:
+        items = json.load(f)
+
+    processed = process_items(items)
+    save_results(processed, args.persona, args.output)
+
+
+if __name__ == "__main__":
+    main()
 

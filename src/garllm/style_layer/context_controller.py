@@ -61,6 +61,20 @@ def _cc_sanitize(text: str) -> str:
     # 構造化ブロックは丸ごと除去して“観察ノイズ”を消す（本文はそのまま）
     return _CODE_BLOCK_RE.sub("", text)
 
+def _extract_json_safely(raw: str) -> dict:
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("No JSON object found")
+
+        candidate = raw[start:end + 1]
+        logger.debug(f"[ContextController] JSON candidate:\n{candidate}")
+        return json.loads(candidate)
+
+    except Exception as e:
+        logger.error(f"[ContextController] Context JSON parse failed: {e}")
+        return {}
 
 def clamp(x: float, lo=-1.0, hi=1.0) -> float:
     """値を -1.0〜1.0 に制限"""
@@ -161,14 +175,10 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False, s
       "Trust": 値, "Familiarity": 値, "Hostility": 値,
       "Dominance": 値, "Empathy": 値, "Instrumentality": 値
     }},
-    "<{persona_name}でない他の人1>": {{
+    "<{persona_name}でない他の人>": {{
       "Trust": 値, "Familiarity": 値, "Hostility": 値,
       "Dominance": 値, "Empathy": 値, "Instrumentality": 値
     }},
-    "<{persona_name}でない他の人2>": {{
-      "Trust": 値, "Familiarity": 値, "Hostility": 値,
-      "Dominance": 値, "Empathy": 値, "Instrumentality": 値
-    }}
     <以下同様に他の人との関係性パラメータが続く場合あり>
   }}
 }}
@@ -194,16 +204,9 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False, s
         logger.debug(raw)
         logger.debug("====== [DEBUG LLM raw Output END] ======")
 
-        # JSONブロック抽出（堅牢対応）
-        m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw, re.DOTALL)
-        if not m:
-            m = re.search(r"\{[\s\S]*?\}", raw, re.DOTALL)
-
-        if not m:
-            raise ValueError("No JSON found")
-
-        candidate = m.group(1) if m else re.search(r"\{[\s\S]*\}", raw, re.DOTALL).group(0)
-        parsed = json.loads(candidate)
+        parsed = _extract_json_safely(raw)
+        if not parsed:
+            raise ValueError("empty parsed json")
 
         # 正規化処理
         emo = {k: clamp(float(parsed.get("emotion_axes", {}).get(k, 0.0))) for k in

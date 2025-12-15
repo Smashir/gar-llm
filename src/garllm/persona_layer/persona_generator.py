@@ -116,54 +116,48 @@ def lines_to_list(s: str, limit: int = 5) -> List[str]:
 # ================================================================
 # 抽出関数群
 # ================================================================
-def extract_anchors(persona_name: str, summary: str, debug=False):
-    prompt = (
-        f"{persona_name} の思想や行動の背景となる重要な概念・経験・信念を3〜5個挙げてください。"
-        f"各行に「概念 — 出典や背景 — 重要性(40〜80文字)」の形式で書いてください。"
-        f"思想概要: {summary}"
-    )
-    raw = ask_vllm_text(prompt, max_tokens=600, debug=debug)
-    raw = raw.replace("―", "-").replace("–", "-").replace("—", "-")
-
-    anchors = []
-    for line in raw.splitlines():
-        line = line.strip(" -*・\t")
-        if not line or len(line) < 3:
-            continue
-        parts = re.split(r"\s*(?:[-–—―]|:|：|–)\s*", line, maxsplit=2)
-        if len(parts) == 3:
-            label, reference, significance = parts
-        elif len(parts) == 2:
-            label, significance = parts
-            reference = ""
-        else:
-            label = parts[0]
-            reference = significance = ""
-        if label.strip():
-            anchors.append({
-                "type": "concept",
-                "label": label.strip(),
-                "reference": reference.strip(),
-                "significance": significance.strip()
-            })
-    return anchors[:5]
-
-
 def extract_style(persona_name: str, summary: str, debug=False):
-    """発話スタイル・語尾・キーワード抽出"""
+    """発話スタイル・語尾・キーワード抽出（人称は関係性で揺れる前提）"""
+
     prompts = {
-        "first_person": f"{persona_name} が自分を指す一人称を1つだけ日本語で答えてください。出力は1行のみ。思想概要: {summary}",
-        "second_person": f"{persona_name} が他者を呼ぶときの二人称を1つだけ日本語で答えてください。出力は1行のみ。思想概要: {summary}",
+        # 一人称：状況で変わるので候補を複数
+        "first_person": f"""
+{persona_name} が自分を指す一人称の「候補」を2〜5個、日本語で列挙してください。
+以下の観点で“使い分けができるように”選ぶこと：
+- 親密（フラット） / 敬意（改まった） / 威圧（上から） / 弱気（下から）の揺らぎ
+出力は候補のみ（各行1つ）。説明文は不要。
+
+思想概要: {summary}
+""".strip(),
+
+        # 二人称：相手との上下・距離・敵対で変わるので候補を複数
+        "second_person": f"""
+{persona_name} が他者を呼ぶ二人称・呼称の「候補」を3〜7個、日本語で列挙してください。
+以下の観点で“関係性に応じて選べるように”すること：
+- 親密（タメ口） / 丁寧（敬語） / 上下（目上・目下） / 敵対（突き放す）
+- 敬称（さん/殿/君/お前 等）も含めてよい
+出力は候補のみ（各行1つ）。説明文は不要。
+
+思想概要: {summary}
+""".strip(),
+
+        # 語尾：従来通り
         "speech_suffix": (
-            f"{persona_name} の発話文末によく現れる語尾や言い回しを3〜5個、各行に1つずつ列挙してください。"
+            f"{persona_name} の発話文末によく現れる語尾や言い回しを3〜7個、各行に1つずつ列挙してください。"
             f"説明や例文は不要です。思想概要:{summary}"
         ),
-        "keywords": f"{persona_name} の思想を象徴する語彙を5つ挙げてください。思想概要:{summary}"
+
+        # キーワード：従来通り（少し増やしてもよい）
+        "keywords": f"{persona_name} の思想を象徴する語彙を5〜8個挙げてください。各行に1つ。思想概要:{summary}",
     }
+
     style = {}
     for key, prompt in prompts.items():
-        raw = ask_vllm_text(prompt, max_tokens=300, debug=debug)
-        style[key] = lines_to_list(raw, limit=5)
+        raw = ask_vllm_text(prompt, max_tokens=350, debug=debug)
+        # 人称や語尾は候補が増えるので limit を少し上げる
+        limit = 10 if key in ("first_person", "second_person", "speech_suffix", "keywords") else 5
+        style[key] = lines_to_list(raw, limit=limit)
+
     return style
 
 
@@ -178,58 +172,115 @@ def extract_expression_prompt(persona_name: str, summary: str, style: Dict[str, 
     return ask_vllm_text(prompt, temperature=0.3, max_tokens=150, debug=debug)
 
 # ================================================================
-# Phase（相）生成ロジック
+# Phase（相）生成ロジック（改良版）
 # ================================================================
 
-def extract_phases(persona_name: str, summary: str, values: list, reasoning: str, speech_pattern: str, debug=False):
+def extract_phases(
+    persona_name: str,
+    summary: str,
+    values: list,
+    reasoning: str,
+    speech_pattern: str,
+    background: str = None,
+    episodes: list = None,
+    anchors: list = None,
+    debug=False
+):
     """
-    人物の「相（Phase）」を抽出する。
-    ここでは LLM に JSON を出力させ、その JSON をパースして phase dict に変換する。
-
-    返り値:
-    {
-      "戦略相": {
-        "description": "...",
-        "style_bias": {...},   # 6軸
-        "emotion_bias": {...}, # 8軸
-        "tone_hint": "..."
-      },
-      ...
-    }
+    人物の相（Phase）を抽出する改良版。
+    background / episodes / anchors がある場合のみ使用。
     """
 
-    # -------- プロンプト定義 --------
+    import json, re
+
+    background_text = background or "(なし)"
+   
+    episodes_text = ""
+    anchors_text = ""
+
+    if episodes:
+        episodes_text = "\n【重要な出来事】\n" + json.dumps(
+            episodes, ensure_ascii=False, indent=2
+        )
+    if anchors:
+        anchors_text = "\n【信念の核】\n" + json.dumps(
+            anchors, ensure_ascii=False, indent=2
+        )
+
+    # ======================================================
+    # ★ ここが最重要：style_bias / emotion_bias の意味定義を明示
+    # ======================================================
     prompt = f"""
 あなたの役割は、人物の「相（Phase）」を設計する専門家です。
 
-【相（Phase）の定義】
-ここでの「相」とは、その人物の
+相（Phase）とは、以下の要素が組み合わさった「人格の振る舞いモード」です：
 - 話し方や語気
 - 感情の出し方
-- 相手との距離感（支配的 / 共感的 など）
+- 相手との距離感（支配的、共感的など）
 - 態度・雰囲気
 
-がひとまとまりになった「振る舞いパターン」のことです。
-1人の人物の中に複数の相があり、状況によって前に出る相が変化します。
+各相には、以下の **対人スタンス6軸（style_bias）** と **感情傾向8軸（emotion_bias）** を数値で指定してください。
 
-あなたは、この人物の相を 3 つ設計し、それぞれに
-- name: 相の名前（3〜8文字程度、日本語）
-- description: その相がどのような振る舞いをするかの説明（日本語）
-- style_bias: 対人スタンスのバイアス（-1.0〜1.0）
-- emotion_bias: 感情のバイアス（-1.0〜1.0）
-- tone_hint: その相で話すときの口調・話し方の説明
+【style_bias（6軸）の意味】
+- **Trust**: 高い=相手を信用する / 低い=警戒・疑い
+- **Familiarity**: 高い=親しみ、カジュアル / 低い=形式的、距離を置く
+- **Hostility**: 高い=批判的・対立的 / 低い=協調的・平和的
+- **Dominance**: 高い=主導権を握る / 低い=控えめ・受容的
+- **Empathy**: 高い=共感・情緒理解 / 低い=客観・ドライ
+- **Instrumentality**: 高い=実務的・目的優先 / 低い=物語的・感情寄り
 
-を与えてください。
+【emotion_bias（8軸）の意味】
+- **joy**: 喜び / 明るさ  
+- **trust**: 安心・温かさ  
+- **fear**: 不安・臆病さ  
+- **surprise**: 驚きやすさ  
+- **sadness**: 悲しみやすさ  
+- **disgust**: 嫌悪・批判性  
+- **anger**: 怒り・苛立ち  
+- **anticipation**: 期待・先走り・予測への傾倒
+
+数値はすべて -1.0〜1.0 で表してください。
+
+------------------------------------------------------------
+【人物情報】
+対象人物：{persona_name}
+
+【思想要約】
+{summary}
+
+【背景】
+{background_text}
+
+【価値観】
+{values}
+
+【思考様式】
+{reasoning}
+
+【人生の重要な出来事】
+{episodes_text}
+
+【信念の核】
+{anchors_text}
+
+【話し方の特徴】
+{speech_pattern}
+
+
+
+------------------------------------------------------------
+あなたの仕事：
+この人物にふさわしい 3つの「相（Phase）」を定義してください。
 
 【出力形式（厳守）】
-次の JSON のみを出力してください。説明文やコメントは一切不要です。
+次の JSON のみを返してください。
 
 ```json
 {{
   "phases": [
     {{
-      "name": "相の名前1",
-      "description": "説明1",
+      "name": "相名",
+      "description": "振る舞いの説明",
       "style_bias": {{
         "Trust": 0.0, "Familiarity": 0.0, "Hostility": 0.0,
         "Dominance": 0.0, "Empathy": 0.0, "Instrumentality": 0.0
@@ -238,117 +289,55 @@ def extract_phases(persona_name: str, summary: str, values: list, reasoning: str
         "joy": 0.0, "trust": 0.0, "fear": 0.0, "surprise": 0.0,
         "sadness": 0.0, "disgust": 0.0, "anger": 0.0, "anticipation": 0.0
       }},
-      "tone_hint": "口調の説明1"
-    }},
-    {{
-      "name": "相の名前2",
-      "description": "説明2",
-      "style_bias": {{ ... 同様 ... }},
-      "emotion_bias": {{ ... 同様 ... }},
-      "tone_hint": "口調の説明2"
-    }},
-    {{
-      "name": "相の名前3",
-      "description": "説明3",
-      "style_bias": {{ ... 同様 ... }},
-      "emotion_bias": {{ ... 同様 ... }},
-      "tone_hint": "口調の説明3"
+      "tone_hint": "口調の説明"
     }}
   ]
-}}
+}}```
 
-数値は必ず -1.0〜1.0 の実数で記述し、
-キー名の綴りや大文字小文字は変更しないでください。
-
-対象人物：{persona_name}
-
-【思想概要】
-{summary}
-
-【価値観】
-{values}
-
-【思考様式】
-{reasoning}
-
-【話し方】
-{speech_pattern}
     """
-
-    # -------- LLM 呼び出し（JSON 解禁）--------
     try:
-        # ここは ask_vllm_text を使わず、JSON を期待する専用呼び出しにする
         raw = request_openai(
             messages=[
-                {
-                    "role": "system",
-                    "content": "あなたは指定されたスキーマに従って厳密な JSON を出力する日本語アシスタントです。"
-                },
+                {"role": "system", "content": "指定スキーマに従って厳密な JSON を返すアシスタントです。"},
                 {"role": "user", "content": prompt}
             ],
             endpoint_type="chat",
             max_tokens=900,
             temperature=0.3,
-        )
-        raw = raw.strip()
-        logger.debug(f"\n[DEBUG extract_phases raw LLM output]\n{raw}\n")
-        
+        ).strip()
     except Exception as e:
-        logger.error(f"[persona_generator] LLM error in extract_phases: {e}")
+        logger.error(f"[persona_generator] extract_phases LLM error: {e}")
         return {}
 
-    # -------- JSON 抽出（context_controller と同じ発想）--------
     try:
-        # ```json ... ``` を優先
         m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw, re.DOTALL)
-        if m:
-            json_str = m.group(1)
-        else:
-            # 最初の { ... } ブロックを拾う
-            m2 = re.search(r"\{[\s\S]*\}", raw, re.DOTALL)
-            json_str = m2.group(0) if m2 else raw
-
-        logger.debug("\n[DEBUG extract_phases candidate JSON]\n", json_str, "\n")
-
+        json_str = m.group(1) if m else re.search(r"\{[\s\S]*\}", raw, re.DOTALL).group(0)
         parsed = json.loads(json_str)
     except Exception as e:
         logger.error(f"[persona_generator] Failed to parse phases JSON: {e}")
         return {}
 
-    # -------- phases 構造に正規化 --------
-    phases_out: Dict[str, Dict[str, Any]] = {}
+    phases_out = {}
     style_axes = ["Trust","Familiarity","Hostility","Dominance","Empathy","Instrumentality"]
     emo_axes = ["joy","trust","fear","surprise","sadness","disgust","anger","anticipation"]
 
-    phase_list = parsed.get("phases") or []
-    for idx, ph in enumerate(phase_list):
-        name = str(ph.get("name") or f"相{idx+1}").strip()
-        if not name:
-            name = f"相{idx+1}"
-
-        desc = str(ph.get("description") or "").strip()
+    for idx, ph in enumerate(parsed.get("phases") or []):
+        name = ph.get("name") or f"相{idx+1}"
+        desc = ph.get("description") or ""
         if not desc:
-            # 説明がない相はスキップ
             continue
-
         sb_raw = ph.get("style_bias") or {}
         eb_raw = ph.get("emotion_bias") or {}
 
-        style_bias = {ax: float(sb_raw.get(ax, 0.0)) for ax in style_axes}
-        emotion_bias = {ax: float(eb_raw.get(ax, 0.0)) for ax in emo_axes}
-        tone_hint = str(ph.get("tone_hint") or "").strip() or "落ち着いた調子。"
-
         phases_out[name] = {
             "description": desc,
-            "style_bias": style_bias,
-            "emotion_bias": emotion_bias,
-            "tone_hint": tone_hint,
+            "style_bias": {ax: float(sb_raw.get(ax, 0.0)) for ax in style_axes},
+            "emotion_bias": {ax: float(eb_raw.get(ax, 0.0)) for ax in emo_axes},
+            "tone_hint": ph.get("tone_hint", "落ち着いた調子"),
         }
 
-    logger.debug("\n[DEBUG extract_phases normalized phases]\n",
-            json.dumps(phases_out, ensure_ascii=False, indent=2),"\n")
-
     return phases_out
+
 
 
 def default_phase_dynamics():
@@ -364,27 +353,71 @@ def default_phase_dynamics():
 # persona統合処理
 # ================================================================
 def extract_persona_profile(thought_data: Dict[str, Any], persona_name: str, debug=False) -> Dict[str, Any]:
-    """思想＋スタイル＋相（phase）情報を統合してPersonaデータ生成"""
+    """
+    再設計版:
+      - anchors/episodes は thought_profiler の出力をそのまま使用する
+      - style は summary + background を参照して抽出
+      - phases は anchors/episodes を含めて抽出
+      - core_profile に episodes を追加
+    """
+
     summary = thought_data.get("summary", "")
     background = thought_data.get("background", "")
     values = thought_data.get("values", [])
     reasoning_pattern = thought_data.get("reasoning_pattern", "")
     speech_pattern = thought_data.get("speech_pattern", "")
 
-    anchors = extract_anchors(persona_name, summary, debug)
-    style = extract_style(persona_name, summary, debug)
+    demographic = thought_data.get("demographic", {}) or {}
+    language_profile = thought_data.get("language_profile", {}) or {}
+
+
+    # thought_profiler が生成した episodes / anchors を採用
+    episodes = thought_data.get("episodes", [])
+    anchors = thought_data.get("anchors", [])
+
+    # --- style 抽出: summary + background + language_profile を使う ---
+    style_input_text = f"{summary}\n\n【背景】{background}"
+
+    # 言語・口調の背景をテキスト化
+    lang_lines = []
+    if isinstance(language_profile, dict):
+        dialect = language_profile.get("dialect")
+        if isinstance(dialect, str) and dialect.strip() and dialect.strip() != "不明":
+            lang_lines.append(f"方言・なまり: {dialect.strip()}")
+        speech_style = language_profile.get("speech_style")
+        if isinstance(speech_style, str) and speech_style.strip():
+            lang_lines.append(f"話し方のスタイル: {speech_style.strip()}")
+        samples = language_profile.get("sample_phrases")
+        if isinstance(samples, list) and samples:
+            joined = " / ".join(str(s) for s in samples[:6])
+            lang_lines.append(f"よく使いそうな表現: {joined}")
+
+    if lang_lines:
+        style_input_text += "\n\n【言語・話し方の背景】\n" + "\n".join(lang_lines)
+
+    style = extract_style(persona_name, style_input_text, debug)
+
+
+
+    # --- expression_prompt ---
     expression_prompt = extract_expression_prompt(persona_name, summary, style, debug)
 
+    # --- phases: episodes / anchors を使用して LLM 生成 ---
     phases = extract_phases(
-        persona_name,
-        summary,
-        values,
-        reasoning_pattern,
-        speech_pattern,
+        persona_name=persona_name,
+        summary=summary,
+        values=values,
+        reasoning=reasoning_pattern,
+        speech_pattern=speech_pattern,
+        background=background,
+        episodes=episodes,
+        anchors=anchors,
         debug=debug
     )
 
-    # === 動的位相パラメータ ===
+
+
+    # phase_dynamics（そのまま使用）
     phase_dynamics = default_phase_dynamics()
 
     return {
@@ -396,18 +429,22 @@ def extract_persona_profile(thought_data: Dict[str, Any], persona_name: str, deb
             "values": values if isinstance(values, list) else [values],
             "reasoning_pattern": reasoning_pattern,
             "speech_pattern": speech_pattern,
-            "knowledge_anchors": anchors
+            "episodes": episodes,
+            "knowledge_anchors": anchors,
+            "demographic": demographic,
+            "language_profile": language_profile,
         },
 
+
         "style": style,
+        "expression_bank": {},
 
-        "expression_bank": {},  # 後工程で埋める余地（今は空でOK）
-
-        "phases": phases,                  # ★ 相を統合
-        "phase_dynamics": phase_dynamics,  # ★ Dynamicsを統合
+        "phases": phases,
+        "phase_dynamics": phase_dynamics,
 
         "expression_prompt": expression_prompt
     }
+
 
 # ================================================================
 # main

@@ -185,7 +185,7 @@ def _auto_generate_persona(persona_name: str) -> bool:
                     ensure_ascii=False
                 ),
                 "--output", str(RETRIEVED_DIR / f"retrieved_{persona_name}.json"),
-                "--limit", "15",
+                "--limit", "5",
             ],
         ),
         # semantic_condenser: 人物要約（summary）生成（semantic_*.json）

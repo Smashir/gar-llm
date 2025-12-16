@@ -23,7 +23,11 @@ import sys
 import json
 import re
 import argparse
+
+import textwrap
+
 from typing import Any, Dict, List
+from pathlib import Path
 
 #sys.path.append(os.path.expanduser("~/modules/gar-llm/src/"))
 from garllm.utils.env_utils import get_data_path
@@ -170,6 +174,80 @@ def extract_expression_prompt(persona_name: str, summary: str, style: Dict[str, 
         f"思想概要:{summary} 文体情報:{style_summary}"
     )
     return ask_vllm_text(prompt, temperature=0.3, max_tokens=150, debug=debug)
+
+
+def generate_expression(persona_name: str, persona: dict, debug: bool = False) -> dict:
+    """
+    persona 情報から expression_<persona>.json を自動生成する。
+    - シンプル固定フォーマット
+    - 各配列 2〜3 個
+    - JSON のみ出力させる
+    """
+
+    core = persona.get("core_profile", {})
+    style = persona.get("style", {})
+
+    json_schema = textwrap.dedent("""\
+        {
+        "talk": {
+            "intro": [],
+            "agree": [],
+            "disagree": []
+        },
+        "emotion": {
+            "joy": [],
+            "anger": []
+        },
+        "battle_cries": []
+        }
+    """).strip()
+
+    prompt = textwrap.dedent(f"""\
+        あなたは{persona_name}の発話表現を設計する専門家です。
+
+        以下の人物情報から、世界観、時代、文化、社会的立場や属性、価値観、話し方の特徴を反映した
+        発話の素材となる本人の決まり文句や口癖をそれぞれ2～3個ずつ JSON 形式で生成してください。
+
+        人物概要:
+        {json.dumps(core, ensure_ascii=False, indent=2)}
+
+        話し方:
+        {json.dumps(style, ensure_ascii=False, indent=2)}
+
+        出力形式:
+        出力は JSON のみ。説明は禁止。        
+        {json_schema}
+
+    """).strip()
+
+
+    try:
+        raw = request_openai(
+            messages=[
+                {"role": "system", "content": "出力は必ず JSON のみ。説明や前置きは禁止。"},
+                {"role": "user", "content": prompt},
+            ],
+            endpoint_type="chat",
+            max_tokens=700,
+            temperature=0.5,
+        )
+        raw = (raw or "").strip()
+        if debug:
+            logger.debug("[expression raw]\n" + raw)
+    except Exception as e:
+        logger.error(f"[expression] LLM error: {e}")
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        logger.error(f"[expression] JSON parse failed: {e}")
+        return {}
+
+    return parsed
+
+
+
 
 # ================================================================
 # Phase（相）生成ロジック（改良版）
@@ -518,6 +596,19 @@ def main():
         json.dump(persona, f, ensure_ascii=False, indent=2)
 
     logger.info(f"[persona_generator] Persona saved: {out_path}")
+
+    expr_dir = Path(get_data_path("personas"))
+    expr_dir.mkdir(parents=True, exist_ok=True)
+
+    expr_path = expr_dir / f"expression_{args.persona}.json"
+    if not expr_path.exists():
+        expression = generate_expression(args.persona, persona, debug=args.debug)
+        if expression:
+            expr_path.write_text(
+                json.dumps(expression, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            logger.info(f"[persona_generator] expression generated: {expr_path}")
 
 
 if __name__ == "__main__":

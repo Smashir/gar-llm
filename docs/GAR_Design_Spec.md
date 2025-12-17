@@ -37,8 +37,8 @@ GAR は、ペルソナ同化・文脈制御・感情変調を統合した拡張L
 │   │   └── systemd_units/        # systemd サービス設定
 │   │       ├── env/              # 各モデルの環境変数設定 (*.env)
 │   │       └── vllm@.service     # vLLM 用テンプレートユニット
-│   └── ollama/                   # ollama 管理
-│       └─── scripts/             # ollama 管理スクリプト群
+│   └── ollama/                   # ollama 管理 (案)
+│       └─── scripts/             # ollama 管理スクリプト群 (案)
 │
 ├── llm/
 │   └── vllm-spark/               # 使用アーキテクチャごとに必要に応じてビルドしたLLMサーバープログラム
@@ -54,21 +54,34 @@ GAR は、ペルソナ同化・文脈制御・感情変調を統合した拡張L
 │           │   │   └── api_router.py          # 外部API統合（REST拡張用）(案)
 │           │   │
 │           │   ├── persona_layer/             # ペルソナ生成
+│           │   │   └── persona_generator.py   # ペルソナ生成スクリプト
+│           │   │
 │           │   ├── style_layer/               # 文体・感情変調、文脈の制御
+│           │   │   ├── context_controller.py  # 人格の感情・関係制御用スクリプト
+│           │   │   ├── response_modulator.py  # 応答文に人格を反映させるスクリプト
+│           │   │   └── style_modulator.py     # 文章に人格を反映させるスクリプト(陳腐化)
+│           │   │
 │           │   ├── retriever_layer/           # 知識補完層、データの収集
-│           │   ├── utils/                     # 共通関数群 (env_utils, llm_client など)
+│           │   │   ├── retriever.py           # キーワードをもとに Duck Duck Go で情報を収集する
+│           │   │   ├── semantic_condenser.py  # 収集した情報を要約するスクリプト
+│           │   │   └── thought_profiler.py    # 要約した情報から、思想を抽出するスクリプト
+│           │   │
+│           │   ├── utils/                     # 他のスクリプトが共通して参照する機能
+│           │   │   ├── env_utils.py           # 入出力ファイルのディレクトリ情報
+│           │   │   ├── llm_client.py          # vLLMか、ollamaかバックエンドを切り替えて、OpenAI互換で接続する
+│           │   │   └── logger.py              # ログ出力処理
 │           │   └── __init__.py                # GAR初期化・メタ情報 (案)
 │           │
 │           └── pyproject.toml                 # Pythonパッケージ用メタデータ
 │   
 ├── data/
-│   ├── retrieved/                # retriever_layerから取得したデータ
-│   ├── semantic/                # retrievedからcondenser, semanitc_condenserで抽出した意味データ
-│   ├── thoughts/                # semanticsからthought_profilerで生成抽出した思想データ
-│   ├── personas/                # thoughtsから persona_generatorで生成したペルソナ(人格)データ
-│   │   ├── 織田信長.json
-│   │   ├── 徳川家康.json
-│   │   └── トーマスエジソン.json
+│   ├── retrieved/                              # retriever_layerから取得したデータ
+│   ├── semantic/                               # retrievedからcondenser, semanitc_condenserで抽出した意味データ
+│   ├── thoughts/                               # semanticsからthought_profilerで生成抽出した思想データ
+│   ├── personas/                               # ペルソナ(人格)関連データ
+│   │   ├── persona_<persona name>.json         # ペルソナデータ本体
+│   │   ├── expression_<persona name>.json      # 表現ライブラリ
+│   │   └── state_<persona name>.json           # 感情軸、関係軸状態量
 │   │
 │   ├── memory/                  # 会話ログ・短期/長期記憶（context_controller 出力）(案)
 │   │   ├── short_term/
@@ -94,9 +107,8 @@ GAR は、ペルソナ同化・文脈制御・感情変調を統合した拡張L
 ### 3.1 実行環境
 | python 仮想環境 | 概要 |
 |------------------|------|
-| **vllm_env** | vLLM ベースのLLM実行環境|
-| **ollama_env** | ollama ベースのLLM実行環境|
-| **orchestrator_env** | 各モジュールの連携制御を担う中核環境 |
+| **vllm/.venv** | vLLM ベースのLLM実行環境|
+| **gar-llm/.venv** | GAR実行環境|
 
 ### 3.2 レイヤー
 | レイヤー | 概要 |

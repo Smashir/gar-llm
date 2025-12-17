@@ -129,6 +129,20 @@ def _extract_user_axes(relations: dict | None) -> dict | None:
             return axes
     return None
 
+
+def parse_persona_with_constraint(raw: str):
+    """
+    'スネーク@メタルギアソリッド'
+      -> ('スネーク', 'メタルギアソリッド')
+
+    '@' がなければ拘束条件なし
+    """
+    if "@" in raw:
+        name, constraint = raw.split("@", 1)
+        return name.strip(), constraint.strip()
+    return raw.strip(), None
+
+
 # ユーティリティ: 先頭の {name}: / {name}： を全部はがして、必要なら1回だけ付ける
 def _normalize_persona_prefix(text: str, persona_name: str, keep_one: bool) -> str:
     if not text:
@@ -161,9 +175,14 @@ def _run_step(script_name: str, args: list[str]):
     return True
 
 
-def _auto_generate_persona(persona_name: str) -> bool:
+#def _auto_generate_persona(persona_name: str) -> bool:
+def _auto_generate_persona(persona_name: str, constraint: str | None = None) -> bool:
+
     """retriever → semantic_condenser → thought_profiler → persona_generator を順次起動"""
     logger.info(f"Persona '{persona_name}' not found, auto-generation triggered.")
+    base = persona_name
+    if constraint:
+        base = f"{persona_name} {constraint}"
 
     steps = [
         # retriever: 生情報取得＋clean_text生成（cleaned_*.json）
@@ -173,14 +192,14 @@ def _auto_generate_persona(persona_name: str) -> bool:
                 "--queries",
                 json.dumps(
                     [
-                        persona_name,
-                        f"{persona_name} 性別",
-                        f"{persona_name} 話し方",
-                        f"{persona_name} 口調",
-                        f"{persona_name} 方言",
-                        f"{persona_name} なまり",
-                        f"{persona_name} キャラクター",
-                        f"{persona_name} 自己紹介",
+                        base,
+                        f"{base} 性別",
+                        f"{base} 話し方",
+                        f"{base} 口調",
+                        f"{base} 方言",
+                        f"{base} なまり",
+                        f"{base} キャラクター",
+                        f"{base} 自己紹介",
                     ],
                     ensure_ascii=False
                 ),
@@ -231,12 +250,13 @@ def _auto_generate_persona(persona_name: str) -> bool:
 
 
 
-def _ensure_persona_exists(persona_name: str):
+def _ensure_persona_exists(persona_name: str, constraint: str | None = None):
     """ペルソナが存在しない場合、自動生成を行う"""
     persona_path = PERSONA_DIR / f"persona_{persona_name}.json"
     if persona_path.exists():
         return True
-    return _auto_generate_persona(persona_name)
+    return _auto_generate_persona(persona_name, constraint)
+
 
 
 def _run_context_update(persona_name: str, user_text: str, mode: str = "llm", debug: bool = False):
@@ -372,8 +392,11 @@ def extract_persona_from_messages(messages):
         commands = extract_gar_commands(text)
         persona_cmds = [c for c in commands if c["cmd"] == "persona"]
         if persona_cmds:
-            persona = persona_cmds[-1]["body"].split(";")[0].strip()
-            return persona
+            #persona = persona_cmds[-1]["body"].split(";")[0].strip()
+            #return persona
+            raw = persona_cmds[-1]["body"].split(";")[0].strip()
+            persona_name, constraint = parse_persona_with_constraint(raw)
+            return persona_name, constraint
     return None
 
 
@@ -442,12 +465,22 @@ async def chat_completions(request: Request):
 
 
     # persona 指定を検出する
+    '''
     persona_name = (
         req.get("persona")
         or extract_persona_from_messages(messages)
         or args.persona
         or "default"
     )
+    '''
+    persona_info = extract_persona_from_messages(messages)
+
+    if isinstance(persona_info, tuple):
+        persona_name, persona_constraint = persona_info
+    else:
+        persona_name = persona_info or req.get("persona") or args.persona or "default"
+        persona_constraint = None
+
 
     # gar.persona が新たに指定されていた場合のみ切り替え通知
     commands = extract_gar_commands(last_message)
@@ -517,7 +550,7 @@ async def chat_completions(request: Request):
                 logger.error(f"[HANDSHAKE] Error during stabilization: {e}")
 
     # personaが存在しなければ自動生成
-    if not _ensure_persona_exists(persona_name):
+    if not _ensure_persona_exists(persona_name, persona_constraint):
         return JSONResponse(
             status_code=500,
             content={"error": f"Persona generation failed for '{persona_name}'"}

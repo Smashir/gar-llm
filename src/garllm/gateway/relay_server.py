@@ -427,6 +427,19 @@ def get_last_message(messages):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     req = await request.json()
+
+    logger.info("OpenWebUI req keys: %s", sorted(req.keys()))
+    # 値は長いので、まずは “パラメータだけ”
+    logger.info("OpenWebUI gen-ish params: %s", json.dumps(
+        {k: req.get(k) for k in sorted(req.keys()) if k not in ["messages"]},
+        ensure_ascii=False
+    ))
+
+    # ---- OpenWebUIから来た「生成系パラメータ」を抽出（指定されているキーだけ）----
+    # messages/model/stream は生成パラメータではないので除外
+    GAR_RESERVED = {"messages", "model", "stream", "intensity", "verbose", "persona"}
+    gen_params = {k: req.get(k) for k in req.keys() if k not in GAR_RESERVED and req.get(k) is not None}
+
     messages = req.get("messages", [])
     if not messages:
         return JSONResponse(status_code=400, content={"error": "messages is required"})
@@ -445,9 +458,12 @@ async def chat_completions(request: Request):
         raw_response = request_llm(
             messages=messages,  # オリジナルのまま
             backend="auto",
-            temperature=0.7,
-            max_tokens=800,
+            temperature=float(req.get("temperature", 0.7)),
+            max_tokens=int(req.get("max_tokens", 800)),
+            top_p=float(req.get("top_p", 1.0)),
+            extra_params=gen_params,
         )
+        
         return JSONResponse(
             content={
                 "id": f"chatcmpl-{os.urandom(8).hex()}",
@@ -575,10 +591,11 @@ async def chat_completions(request: Request):
         persona_name=persona_name,
         intensity=intensity,
         verbose=verbose,
-        emotion_axes=emotion_axes,        
+        emotion_axes=emotion_axes,
         relations=relations,
         debug=args.debug,
-        log_console=args.log_console
+        log_console=args.log_console,
+        gen_params=gen_params,
     )
 
     keep_one = (args.prefix_persona == "on") and (persona_name and persona_name != "default")

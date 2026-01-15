@@ -975,21 +975,34 @@ def ask_llm(prompt: str, temperature=0.6, max_tokens=800) -> str:
 
 
 # ============================================================
-# 💬 Chat形式 LLM Interface（新規追加）
+# 💬 Chat形式 LLM Interface
 # ============================================================
-def ask_llm_chat(messages: list[dict[str, str]],temperature=0.6, max_tokens=800) -> str:
+def ask_llm_chat(
+    messages: list[dict[str, str]],
+    temperature=0.6,
+    max_tokens=800,
+    top_p: float = 1.0,
+    gen_params: dict | None = None,
+) -> str:
     """
     Chat形式 (messages[]) 入力対応版。
-    OpenWebUI や relay_server から直接 messages を受け取る場合に使用。
+    gen_params があれば request_llm に extra_params として渡す。
     """
     try:
-        response = request_llm(messages=messages, backend="auto", temperature=temperature, max_tokens=max_tokens)
-        # cleaned = re.split(r"---+", response, maxsplit=1)[0].strip()
+        response = request_llm(
+            messages=messages,
+            backend="auto",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            extra_params=gen_params or {},
+        )
         cleaned = response.strip()
         return cleaned
     except Exception as e:
         logger.error(f"[response_modulator] Chat LLM error: {e}")
         return ""
+
 
 # ============================================================
 # 🎭 Response Modulation Core
@@ -1003,7 +1016,8 @@ def modulate_response(
     relations: dict[str, dict[str, float]] | None = None,  # ← relay_server から渡される複数関係
     emotion_axes: dict[str, float] | None = None,
     debug: bool = False,
-    log_console: bool = False
+    log_console: bool = False,
+    gen_params: dict | None = None,
 ):
     """
     text が str なら従来どおり build_prompt() を使う。
@@ -1126,7 +1140,15 @@ def modulate_response(
 
         logger.debug(f"persona_system_message:\n{json.dumps(persona_system_message, ensure_ascii=False, indent=2)}")
 
-        response = ask_llm_chat(messages_with_persona)
+        response = ask_llm_chat(
+            messages_with_persona,
+            # OpenWebUIから来た値があればそれを優先させる（無ければ ask_llm_chat 側デフォルト）
+            temperature=(gen_params or {}).get("temperature", 0.6),
+            max_tokens=(gen_params or {}).get("max_tokens", 800),
+            top_p=(gen_params or {}).get("top_p", 1.0),
+            gen_params=gen_params,
+        )
+
         return response.strip() if response else ""
 
     # テキストモード（旧 CLI 互換）

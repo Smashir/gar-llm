@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Dict, Any
 import re
 import sys
+import time
+import hashlib
 
 
 # sys.path.append(os.path.expanduser("~/modules/gar-llm/src/"))
@@ -38,6 +40,156 @@ from garllm.utils.logger import get_logger
 
 # ロガー初期化
 logger = get_logger("response_modulator", level="INFO", to_console=False)
+
+
+_STYLE_PROFILE_STATS = {"hit": 0, "miss": 0}
+
+# ============================================================
+# ⚡ Speed-up caches (in-process)
+# ============================================================
+_PERSONA_CACHE: dict[str, dict] = {}
+_STYLE_PROFILE_CACHE: dict[str, dict[str, object]] = {}  # key -> {"profile": str, "ts": float}
+# style_profile cache GC (TTL + max entries)
+def _gc_style_profile_cache(ttl_sec: float, max_entries: int) -> int:
+    """
+    TTL超過を削除し、max_entriesを超えたら古い順に削除する。
+    戻り値: 削除した件数
+    """
+    if ttl_sec <= 0 and (max_entries is None or max_entries <= 0):
+        return 0
+
+    now = time.time()
+    removed = 0
+
+    # 1) TTL超過を削除
+    if ttl_sec > 0:
+        expired = []
+        for k, ent in _STYLE_PROFILE_CACHE.items():
+            try:
+                ts = float(ent.get("ts", 0.0))
+            except Exception:
+                ts = 0.0
+            if (now - ts) > ttl_sec:
+                expired.append(k)
+
+        for k in expired:
+            if _STYLE_PROFILE_CACHE.pop(k, None) is not None:
+                removed += 1
+
+    # 2) max_entries超過を削除（古い順）
+    if max_entries is not None and max_entries > 0:
+        over = len(_STYLE_PROFILE_CACHE) - max_entries
+        if over > 0:
+            items = sorted(
+                _STYLE_PROFILE_CACHE.items(),
+                key=lambda kv: float((kv[1] or {}).get("ts", 0.0)),
+            )
+            for i in range(over):
+                k = items[i][0]
+                if _STYLE_PROFILE_CACHE.pop(k, None) is not None:
+                    removed += 1
+
+    return removed
+
+
+def _quantize_axes(axes: dict[str, float] | None, step: float = 0.25) -> dict[str, float]:
+    """
+    小さな揺れでキャッシュが無効化されないよう、軸値を粗く丸める。
+    step=0.25 なら -1..1 を 0.25刻み。
+    """
+    if not axes:
+        return {}
+    q: dict[str, float] = {}
+    for k, v in axes.items():
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        fv = max(-1.0, min(1.0, fv))
+        q[k] = round(fv / step) * step
+    return q
+
+
+def _quantize_phase_weights(
+    phase_weights: dict[str, float] | None,
+    *,
+    step: float = 0.25,
+    scale_by_n: bool = True,
+) -> list[tuple[str, float]]:
+    """
+    phase_weights(総和=1) を「全相・固定順」で量子化して署名にする。
+
+    - 全相を捉える（Top-Kにしない）ので、A/B逆転なども確実に検出できる
+    - N相の違いを吸収したい場合は scale_by_n=True にして w*N を量子化する
+    - 出力は [(phase_name, bucket), ...] の安定なリスト（name順）
+    """
+    if not phase_weights:
+        return []
+
+    # 安定順（辞書順の揺れを避ける）
+    names = sorted([k for k in phase_weights.keys() if isinstance(k, str)])
+    n = len(names) if names else 0
+    if n <= 0:
+        return []
+
+    sig: list[tuple[str, float]] = []
+    for name in names:
+        v = phase_weights.get(name, 0.0)
+        try:
+            w = float(v)
+        except Exception:
+            w = 0.0
+        w = max(0.0, min(1.0, w))
+
+        x = (w * n) if scale_by_n else w
+        # 量子化
+        b = round(x / step) * step
+        sig.append((name, round(float(b), 4)))
+
+    return sig
+
+
+def _style_profile_cache_key(
+    persona_name: str,
+    phase_weights: dict[str, float] | None,
+    relation_axes: dict[str, float] | None,
+    emotion_axes: dict[str, float] | None,
+    intensity: float,
+    *,
+    step_axes: float = 0.25,
+    step_phase: float = 0.25,
+    scale_phase_by_n: bool = True,
+) -> str:
+    """
+    キャッシュキー：persona + 量子化した phase_weights + 量子化した関係/感情 + intensity(粗く)
+
+    phase_fusion(description/refs) は「文字列・順序」が揺れやすいのでキーから外す。
+    """
+    payload = {
+        "persona": persona_name,
+        "phase": _quantize_phase_weights(
+            phase_weights,
+            step=step_phase,
+            scale_by_n=scale_phase_by_n,
+        ),
+        "rel": _quantize_axes(relation_axes, step=step_axes),
+        "emo": _quantize_axes(emotion_axes, step=step_axes),
+        "int": round(float(intensity), 2),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def load_persona_profile_cached(persona_name: str) -> Dict[str, Any]:
+    """
+    既存 load_persona_profile のキャッシュ版（同一プロセス内）
+    """
+    if persona_name in _PERSONA_CACHE:
+        return _PERSONA_CACHE[persona_name]
+    data = load_persona_profile(persona_name)
+    _PERSONA_CACHE[persona_name] = data
+    return data
+
 
 # ============================================================
 # 📂 Persona Profile Loader
@@ -721,6 +873,9 @@ def build_style_profile_with_llm(
     phase_fusion: Dict[str, Any],
     relation_axes: Dict[str, float] | None = None,
     emotion_axes: Dict[str, float] | None = None,
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 384,
 ) -> str:
     """
     相の重畳結果 + persona 基本情報 + 関係軸 + 感情軸 + expression をまとめて、
@@ -728,22 +883,19 @@ def build_style_profile_with_llm(
 
     ※ meta.styleNotes / song.chorus / talk.intro などの expression タグは
        あくまで「内部タグ」としてだけ渡し、style_profile 本文には出させない。
+
+    速度最適化:
+      - max_tokens は 2048 固定ではなく、呼び出し側から下げられるようにする
     """
 
-    # --- 相の重畳結果から fused 情報を取り出す ---
     fused_style_bias = phase_fusion.get("style_bias") or {}
     fused_emotion_bias = phase_fusion.get("emotion_bias") or {}
     fused_desc = (phase_fusion.get("description") or "").strip() or "（相の説明なし）"
     expr_refs = phase_fusion.get("expression_refs") or []
 
-    # expression の "cat.key" をカテゴリ単位に圧縮（meta / song / talk など）
     unique_cats: list[str] = []
     if expr_refs:
-        cats = {
-            ref.split(".", 1)[0]
-            for ref in expr_refs
-            if isinstance(ref, str) and "." in ref
-        }
+        cats = {ref.split(".", 1)[0] for ref in expr_refs if isinstance(ref, str) and "." in ref}
         unique_cats = sorted(cats)
 
     if unique_cats:
@@ -751,28 +903,22 @@ def build_style_profile_with_llm(
     else:
         expr_block = "（指定なし）"
 
-    # --- expression_<persona>.json から代表的なフレーズをいくつかサンプルとして渡す ---
-    #   （プロンプト生成用 LLM には見せるが、応答生成用 LLM には style_profile テキストだけを渡す）
-    #expr_samples = extract_expression_snippets(persona_data, None)  # 全体から代表例を1〜3個サンプル
+    # 代表フレーズは少数だけ（長文化抑制）
     expr_samples = sample_expression_snippets_weighted(
         persona_data,
         phase_fusion.get("expression_refs"),
-        max_samples=3,
+        max_samples=2,  # ← 元は3。少し削る
     )
 
-
-    # --- persona 基本情報 ---
     core_summary = summarize_core_profile(persona_data)
     style = persona_data.get("style", {})
     first_person = style.get("first_person", []) or ["私"]
     second_person = style.get("second_person", []) or ["あなた"]
     keywords = style.get("keywords", []) or []
 
-    # --- 関係性・感情軸を自然文ヒントに変換 ---
     rel_hint = synthesize_relation_hint(relation_axes) if relation_axes else "（指定なし）"
     emo_hint = generate_emotion_prompt(emotion_axes) if emotion_axes else "感情指針: （指定なし）"
 
-    # --- LLM 用プロンプト ---
     prompt = f"""
 あなたは「ペルソナ話法設計アシスタント」です。
 目的は、以下の情報をもとに、LLM が『{persona_name}』として発話するための
@@ -813,44 +959,20 @@ def build_style_profile_with_llm(
 【参考用 expression サンプル（このままコピペせず、ニュアンスだけを使うこと）】
 {expr_samples if expr_samples else "（特に指定なし）"}
 
-※上記のタグ名（meta / song / talk など）や cat.key 形式の識別子は、
-  「どの種類のフレーズを素材として使えるか」というヒントとしてだけ利用してください。
-  あなたが生成する話法・スタイル指針テキストには、
-  これらのタグ名・カテゴリ名（meta.styleNotes / song.chorus / talk.intro 等）や
-  cat.key 形式の文字列を一切含めないでください。
-※expression サンプルに含まれるフレーズも、そのまま繰り返さず、
-  意味とノリを保ちつつ、理解できる単語で言い換え・語尾変形・複数の要素の合成などで
-  「揺らぎを持った代表的な言い回し」として書いてください。
-
 【出力要件】
-- 以下の各項目をすべて考慮し、箇条書きまたは短い段落でわかりやすい要件にまとめなさい:
-  - 口調（丁寧さ、威圧/柔らかさ、テンション）
-  - 語彙傾向（古語、現代語、カタカナ語、慣用表現、比喩の使い方など）
-  - リズム・文長（短文主体か、長文か、間の取り方など）
-  - 効果音・歌・ノリの使い方
-  - フレーズの使い方・揺らぎの付け方
-    （expression 由来のフレーズをそのまま列挙するのではなく、
-      類語・語尾変形・即興造語などの「使い方の方針」を説明すること）
-- 可能であれば、ペルソナらしさがよく出る代表的なセリフ・掛け声・歌い出しなどを
-  2〜5個程度、上記方針に従って**揺らぎを付けた形で**例示してよい。
-  （ただし expression サンプルの完全コピーは禁止）
-- 文脈によって揺らぎが生まれるような話法の方向性を示し、
-  固定フレーズではなく「揺らぎを持つスタイル」を定義してください。
-- 出力は JSON ではなく、日本語の説明文のみとします。
+- 口調 / 語彙傾向 / 文長・リズム / 揺らぎの付け方 を短めに要点化して書く
+- 代表例は 1〜3 個まで（長文化しない）
+- タグ名や cat.key は本文に出さない
 """
-
-    # logger.debug("Style profile generation prompt for persona '%s':\n%s", persona_name, prompt)
 
     style_profile = ask_llm(
         prompt=prompt,
-        temperature=0.3,
-        max_tokens=2048,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
 
-    style_profile = style_profile or ""
-    # logger.debug("Generated style profile for persona '%s':\n%s", persona_name, style_profile)
+    return (style_profile or "").strip()
 
-    return style_profile.strip()
 
     
 
@@ -1044,12 +1166,12 @@ def modulate_response(
             logger.addHandler(console)
     '''
     global logger
-
+    
     # 既存の logger がある場合でも level を更新する
     log_level = "DEBUG" if debug else "INFO"
     logger = get_logger("response_modulator", level=log_level, to_console=log_console)
 
-    persona_data = load_persona_profile(persona_name)
+    persona_data = load_persona_profile_cached(persona_name)
 
     # relations からユーザ対象の軸だけを抽出（あれば）
     if relations and isinstance(relations, dict):
@@ -1066,14 +1188,87 @@ def modulate_response(
     phase_weights = load_phase_weights(persona_name, persona_data)
     phase_fusion = fuse_phase_config(persona_data, phase_weights)
 
-    # --- スタイル・話法プロファイルの生成（prompt生成LLM） ---
-    style_profile = build_style_profile_with_llm(
-        persona_name=persona_name,
-        persona_data=persona_data,
-        phase_fusion=phase_fusion,
-        relation_axes=relation_axes,
-        emotion_axes=emotion_axes,
-    )
+    # --- スタイル・話法プロファイル（重いのでキャッシュ優先） ---
+    # gen_params で挙動を上書き可能:
+    #   style_profile_mode: "cached" | "always" | "off"
+    #   style_profile_max_tokens: int
+    #   style_profile_temperature: float
+    sp_mode = (gen_params or {}).get("style_profile_mode", "cached")
+    sp_max_tokens = int((gen_params or {}).get("style_profile_max_tokens", 384))
+    sp_temp = float((gen_params or {}).get("style_profile_temperature", 0.2))
+    sp_ttl_sec = float((gen_params or {}).get("style_profile_ttl_sec", 3600))  # 1h
+    sp_cache_max_entries = int((gen_params or {}).get("style_profile_cache_max_entries", 256))
+
+    style_profile = ""
+    cache_key = None
+
+    if sp_mode == "off":
+        logger.debug("[style_profile] mode=off (skip)")
+    else:
+        phase_sig = _quantize_phase_weights(
+            phase_weights,
+            step=0.25,
+            scale_by_n=True,
+        )
+        logger.debug(f"[style_profile] phase_sig={phase_sig}")
+
+        cache_key = _style_profile_cache_key(
+            persona_name=persona_name,
+            phase_weights=phase_weights,
+            relation_axes=relation_axes,
+            emotion_axes=emotion_axes,
+            intensity=intensity,
+            step_axes=0.25,
+            step_phase=0.25,
+            scale_phase_by_n=True,
+        )
+
+        # GC: TTL超過や件数超過を掃除（毎回でOK。重ければ間引き運用に変更可）
+        _gc_style_profile_cache(sp_ttl_sec, sp_cache_max_entries)
+
+        if sp_mode == "cached":
+            ent = _STYLE_PROFILE_CACHE.get(cache_key)
+            if ent:
+                ts = float(ent.get("ts", 0.0))
+                age = time.time() - ts
+                if age <= sp_ttl_sec:
+                    style_profile = str(ent.get("profile", "") or "")
+                    _STYLE_PROFILE_STATS["hit"] += 1
+                    logger.debug(
+                        f"[style_profile] HIT key={cache_key[:8]} age={age:.1f}s "
+                        f"hits={_STYLE_PROFILE_STATS['hit']} miss={_STYLE_PROFILE_STATS['miss']}"
+                    )
+                else:
+                    logger.debug(f"[style_profile] EXPIRED key={cache_key[:8]} age={age:.1f}s ttl={sp_ttl_sec:.0f}s")
+                    # TTL超過はキャッシュからも削除して肥大を防ぐ
+                    _STYLE_PROFILE_CACHE.pop(cache_key, None)
+                    
+
+        if (sp_mode in ("always", "cached")) and not style_profile:
+            _STYLE_PROFILE_STATS["miss"] += 1
+            logger.debug(
+                f"[style_profile] MISS key={cache_key[:8]} -> build_style_profile_with_llm() "
+                f"hits={_STYLE_PROFILE_STATS['hit']} miss={_STYLE_PROFILE_STATS['miss']}"
+            )
+
+
+            t0 = time.time()
+            style_profile = build_style_profile_with_llm(
+                persona_name=persona_name,
+                persona_data=persona_data,
+                phase_fusion=phase_fusion,
+                relation_axes=relation_axes,
+                emotion_axes=emotion_axes,
+                temperature=sp_temp,
+                max_tokens=sp_max_tokens,
+            )
+            dt = time.time() - t0
+            logger.debug(f"[style_profile] build_style_profile_with_llm() done in {dt:.2f}s key={cache_key[:8]}")
+
+            _STYLE_PROFILE_CACHE[cache_key] = {"profile": style_profile, "ts": time.time()}
+            _gc_style_profile_cache(sp_ttl_sec, sp_cache_max_entries)
+
+
 
     # --- expression 由来の表現操作ルール（expression_bank 利用） ---
     expression_instruction = build_expression_instruction(

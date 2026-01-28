@@ -162,7 +162,7 @@ def analyze_context_llm(text: str, persona_name: str = "default", debug=False, s
 
 出力仕様：
 - emotion_axes:{persona_name}の感情の変化量（-1.0〜1.0）
-- relations: 対象ごとの関係変化（user＋他persona）
+- relations: 対象ごとの関係変化を"user"について生成、また自分（{persona_name}）以外のペルソナについても生成する
 
 出力形式（厳守）:
 {{

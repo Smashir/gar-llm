@@ -38,7 +38,7 @@ import json
 import time
 import subprocess
 from pathlib import Path
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 import garllm
@@ -425,7 +425,7 @@ def get_last_message(messages):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     req = await request.json()
 
     logger.info("OpenWebUI req keys: %s", sorted(req.keys()))
@@ -452,17 +452,28 @@ async def chat_completions(request: Request):
     verbose = bool(req.get("verbose", False))
 
     # --- OpenWebUIのフォローアップクエスチョンやタイトルなど内部メタタスクを検知した場合は、LLMへ直接パススルー ---
-    if _is_internal_prompt(last_message):
-        #logger.debug("Internal meta task detected — skipping response_modulator and passing through.")
-        # LLMへ直接パススルー
+    internal = _is_internal_prompt(last_message)
+    logger.info(f"[internal_check] last_message_head={last_message[:120]!r} internal={internal}")
+
+    if internal:
+        # internal task の可観測性を上げる（messages全文は長いので要点だけ）
+        try:
+            logger.info(f"[internal_task] last_user_len={len(last_message)}")
+            # 直近数件だけ（長すぎるログを避ける）
+            tail = messages[-6:] if isinstance(messages, list) else []
+            logger.debug("[internal_task] messages_tail=\n" + json.dumps(tail, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.warning(f"[internal_task] log_failed: {e}")
+
         raw_response = request_llm(
-            messages=messages,  # オリジナルのまま
+            messages=messages,
             backend="auto",
             temperature=float(req.get("temperature", 0.7)),
             max_tokens=int(req.get("max_tokens", 800)),
             top_p=float(req.get("top_p", 1.0)),
             extra_params=gen_params,
         )
+
         
         return JSONResponse(
             content={
@@ -571,17 +582,40 @@ async def chat_completions(request: Request):
             status_code=500,
             content={"error": f"Persona generation failed for '{persona_name}'"}
         )
-
-    # 状態更新を実行（context_controllerがstateファイルに結果を書き込む）
-    # _run_context_update(persona_name, cleaned_text, mode="llm", debug=args.debug)
+    
+    # ============================================================
+    # 🧠 Context update (ASYNC) — レイテンシ改善のため非同期モードも実装
+    # ============================================================
     context_input = json.dumps(messages, ensure_ascii=False)
-    _run_context_update(persona_name, context_input, mode="llm", debug=args.debug)
 
-
-    # 更新後のstateを読み出す
+    # このターンは「前回までの state」を使う（即応優先）
     context_data = _load_state(persona_name)
     relations = context_data.get("relations", {})
     emotion_axes = context_data.get("emotion_axes", {})
+
+    # 次ターン以降の state 更新は、設定に応じて同期/非同期を切り替える
+    async_mode = getattr(args, "async_context", "on")
+
+    # ペルソナ切替コマンドが含まれるターンは、直後の1ターン遅れが目立つので同期に強制する
+    force_sync = False
+    try:
+        # last_message はこの関数内で既に使っている（persona_cmds判定に使っている）前提
+        cmds = extract_gar_commands(last_message)
+        persona_cmds = [c for c in cmds if c.get("cmd") == "persona"]
+        if persona_cmds:
+            force_sync = True
+    except Exception:
+        force_sync = False
+
+    if async_mode == "on" and not force_sync:
+        try:
+            background_tasks.add_task(_run_context_update, persona_name, context_input, "llm", args.debug)
+        except Exception as e:
+            logger.error(f"[WARN] failed to schedule async context update: {e}")
+    else:
+        # async-context off または persona 切替ターンは同期更新
+        _run_context_update(persona_name, context_input, mode="llm", debug=args.debug)
+
 
     # 💬 LLMにリレーするmessages全体を確認
     logger.debug("Messages before response modulation:\n" + json.dumps(messages, ensure_ascii=False, indent=2))
@@ -631,6 +665,8 @@ if __name__ == "__main__":
                         help="ペルソナ切替時の名乗りハンドシェイク（on/off/auto）")
     parser.add_argument("--inject-system", choices=["on", "off"], default=os.getenv("GAR_INJECT_SYSTEM", "on"))
     parser.add_argument("--prefix-persona", choices=["on", "off"], default=os.getenv("GAR_PREFIX_PERSONA", "on"))
+    parser.add_argument("--async-context", choices=["on", "off"], default="on",
+                    help="context_controller をバックグラウンドで更新（on=非同期/off=同期）")
     parser.add_argument("--debug", action="store_true", help="デバッグ出力を有効化（--log-console 併用可）")
     parser.add_argument("--log-console", action="store_true", help="ログをコンソールにも出力")
 

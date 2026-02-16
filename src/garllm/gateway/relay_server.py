@@ -399,6 +399,48 @@ def extract_persona_from_messages(messages):
             return persona_name, constraint
     return None
 
+def _normalize_stage_value(raw: str) -> str | None:
+    """
+    gar.stage の body を正規化して "on" / "off" / "auto" のいずれかにする。
+    受け付ける値:
+      - on/off/auto
+      - true/false
+      - 1/0
+      - yes/no
+      - jp: 有効/無効/自動
+    """
+    if raw is None:
+        return None
+    v = raw.strip().lower()
+
+    # 末尾に ;key=val が付いている場合は先頭だけ使う
+    v = v.split(";")[0].strip()
+
+    mapping = {
+        "on": "on", "enable": "on", "enabled": "on", "true": "on", "1": "on", "yes": "on",
+        "off": "off", "disable": "off", "disabled": "off", "false": "off", "0": "off", "no": "off",
+        "auto": "auto", "automatic": "auto", "default": "auto",
+        "有効": "on", "無効": "off", "自動": "auto",
+    }
+    return mapping.get(v, None)
+
+
+def extract_stage_from_messages(messages):
+    """
+    (gar.stage: on/off/auto) 構文から最後に指定された stage モードを抽出。
+    返り値: "on" / "off" / "auto" / None
+    """
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        text = m.get("content", "")
+        commands = extract_gar_commands(text)
+        stage_cmds = [c for c in commands if c["cmd"] == "stage"]
+        if stage_cmds:
+            raw = stage_cmds[-1]["body"].strip()
+            return _normalize_stage_value(raw)
+    return None
+
 
 def inject_system_message(messages: list[dict], content: str):
     """
@@ -437,7 +479,7 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
 
     # ---- OpenWebUIから来た「生成系パラメータ」を抽出（指定されているキーだけ）----
     # messages/model/stream は生成パラメータではないので除外
-    GAR_RESERVED = {"messages", "model", "stream", "intensity", "verbose", "persona"}
+    GAR_RESERVED = {"messages", "model", "stream", "intensity", "verbose", "persona", "stage"}    
     gen_params = {k: req.get(k) for k in req.keys() if k not in GAR_RESERVED and req.get(k) is not None}
 
     messages = req.get("messages", [])
@@ -507,6 +549,14 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     else:
         persona_name = persona_info or req.get("persona") or args.persona or "default"
         persona_constraint = None
+
+
+    # stage（演出）モードを検出する（gar.stage: on/off/auto）
+    # 明示指定がない場合は None（=AUTO相当の既定動作はstyle側で決める）
+    stage_mode = extract_stage_from_messages(messages)
+    if stage_mode:
+        # response_modulator 側で解釈する内部パラメータとして渡す
+        gen_params["gar_stage"] = stage_mode
 
 
     # gar.persona が新たに指定されていた場合のみ切り替え通知

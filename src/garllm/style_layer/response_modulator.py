@@ -1049,8 +1049,8 @@ def build_prompt(
 
     # プロンプト本体
     prompt = f"""
-あなたは今から完全に『{persona_name}』として応答します。
-口調・語彙・価値観・判断基準は {persona_name} のものを厳守してください。
+あなたは主として『{persona_name}』の人格・口調・価値観・判断基準で応答します（厳守）。
+ただし必要に応じて、その場の環境や物理的変化を「無主語のト書き」として短く補足してよい（人格違反ではない）。
 {pronoun_guidance}
 
 【ペルソナの基本情報】
@@ -1094,6 +1094,107 @@ def build_prompt(
 # ============================================================
 def ask_llm(prompt: str, temperature=0.6, max_tokens=800) -> str:
     return ask_llm_chat([{"role": "user", "content": prompt}])
+
+
+def _stage_instruction_from_gen_params(gen_params: dict | None) -> str:
+    """
+    gar_stage:
+      - off: 演出（情景/所作/物理音）を出さない
+      - on : 必要に応じて演出を出す
+      - auto/None: 必要なときだけ演出を出す
+
+    追加フラグ:
+      - gar_stage_force_physical: True のとき「変化があるなら【物理音】を1つ以上」推奨
+      - gar_stage_force_onomatopeia: True のとき【物理音】は擬音必須（説明だけ禁止）
+    """
+    gp = dict(gen_params or {})
+    mode = gp.get("gar_stage", None) or gp.get("stage", None)
+    mode = (str(mode).strip().lower() if mode is not None else None)
+
+    force_physical = bool(gp.get("gar_stage_force_physical", False))
+    force_ono = bool(gp.get("gar_stage_force_onomatopeia", False))
+
+    # 物理音＝物理現象由来（心理/比喩は禁止）
+    physical_rule = (
+        "【物理音】は『いま起きている行為・接触・摩擦・体重移動・呼吸・布/床/家具のきしみ等』"
+        "から必然的に発生する音のみを書く（心理/比喩は音扱いしない）。"
+        "誰の音か説明しない（無主語で短く）。"
+    )
+
+    # 本文とズレる演出を止める（最重要）
+    consistency_rule = (
+        "【整合性】本文（ユーザ発話と直近の会話）に無い動作・状況を勝手に追加しない。"
+        "所作は命令形にしない（〜して、〜しなさい禁止）。描写形で、本文に出ている動作の短い言い換え/補足のみ。"
+        "進行中の状況を『開始/準備』系の所作で巻き戻さない。"
+        "確信が持てない所作や音は書かずに省略してよい。"
+    )
+
+    # 擬音の仕様：出すなら擬音を入れる。長い反復は専用表現で（コピペ連打禁止）
+    onomatopoeia_rule = (
+        "【擬音】音を出す場合は必ず擬音を1つ含める（説明だけ禁止）。"
+        "形式は「擬音」または「擬音（短い説明）」のどちらか。"
+        "同じ音が続く場合、1項目の中でリズムとして表現してよい（例: たっ…たっ…たっ…たっ… / とん、とん、とん…）。"
+        "暴走防止: 擬音は最大3種類の組み合わせ、長さは100文字以内を目安。"
+        "物理的な変化が無いターンは無理に音を出さず省略してよい。"
+    )
+
+
+    # 反復：同一イベントで変化なしなら省略が正解。変化ありなら再描写OK。
+    no_repeat_rule = (
+        "同一イベントでも強度・速度・接触状態が変化した場合は再描写してよい。"
+        "変化が無い場合は、無理に捻らず【物理音】ブロック自体を省略してよい。"
+        "同一の擬音表記や説明文の“そのまま再掲”は避け、出すなら表記や観点を少し変える。"
+    )
+
+    fmt_rule = (
+        "推奨形式（必要なものだけ出す）:\n"
+        "【情景】(0〜2文)\n"
+        "【所作】(0〜2文：本文にある動作の補足のみ)\n"
+        "【物理音】(0〜3項目)\n"
+        "  ※1項目は擬音を含む。リズム列OK（2拍で止めない）。\n"
+        "  例: ことっ / ぎしぎしっ/ たっ…たっ…たっ…たっ… / ぎゅーーー\n"
+        "※ 変化があるときだけ短く入れる。変化がなければ省略してよい。"
+    )
+
+
+    if mode == "off":
+        return (
+            "OFF: 情景描写・所作描写・擬音/物理音・括弧書き演出を出力しない。"
+            "台詞/説明のみを返す。"
+        )
+
+    need_line = ""
+    if force_physical:
+        need_line += "このターンは音描写要求。物理的な変化があるなら【物理音】を1つ以上入れる。変化が無いなら省略してよい。"
+    if force_ono:
+        need_line += "このターンは擬音要求。【物理音】を出す場合は必ず擬音を含め、説明だけは禁止。"
+
+    if mode == "on":
+        return (
+            "ON: 必要に応じて短い情景/所作/物理音を添えてよい。"
+            + physical_rule
+            + need_line
+            + "ただし冗長にしない。台詞は必ず含める。"
+            + consistency_rule
+            + onomatopoeia_rule
+            + no_repeat_rule
+            + "\n"
+            + fmt_rule
+        )
+
+    # auto / None / unknown
+    return (
+        "AUTO: ユーザが演出/描写を求める場合や、行動・接触・物理変化が重要な場合のみ、"
+        "短い情景/所作/物理音を添える。情報回答や短い返答では省略する。"
+        + physical_rule
+        + need_line
+        + consistency_rule
+        + onomatopoeia_rule
+        + no_repeat_rule
+        + "\n"
+        + fmt_rule
+    )
+
 
 
 # ============================================================
@@ -1194,7 +1295,7 @@ def modulate_response(
     #   style_profile_max_tokens: int
     #   style_profile_temperature: float
     sp_mode = (gen_params or {}).get("style_profile_mode", "cached")
-    sp_max_tokens = int((gen_params or {}).get("style_profile_max_tokens", 384))
+    sp_max_tokens = int((gen_params or {}).get("style_profile_max_tokens", 800))
     sp_temp = float((gen_params or {}).get("style_profile_temperature", 0.2))
     sp_ttl_sec = float((gen_params or {}).get("style_profile_ttl_sec", 3600))  # 1h
     sp_cache_max_entries = int((gen_params or {}).get("style_profile_cache_max_entries", 256))
@@ -1312,24 +1413,65 @@ def modulate_response(
 
         core_summary = summarize_core_profile(persona_data)
 
+        _gen_params_local = dict(gen_params or {})
+
+        # ---- 音/演出要求の検出（AUTO時のブレ対策：誤爆を避ける） ----
+        last_user_text = ""
+        for m in reversed(text):
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_user_text = str(m.get("content", "") or "")
+                break
+
+        # 「音を入れて/効果音/物理音」などの明示要求のみで発火（呼吸/吐息など一般語は誤爆するので除外）
+        sound_request_keywords = [
+            "物理音", "効果音", "SE", "サウンド", "音描写",
+            "音を入れて", "音も入れて", "音も", "音つけて", "音入れて",
+        ]
+        # 擬音を“必ず”欲しい時だけ別フラグ
+        onomatopoeia_request_keywords = [
+            "擬音", "オノマトペ", "オノマトペを", "擬音を",
+        ]
+
+        sound_requested = any(k in last_user_text for k in sound_request_keywords)
+        ono_requested = any(k in last_user_text for k in onomatopoeia_request_keywords)
+
+        stage_mode = (_gen_params_local.get("gar_stage") or _gen_params_local.get("stage"))
+        stage_mode = (str(stage_mode).strip().lower() if stage_mode is not None else None)
+
+        # 明示 off は最優先
+        if stage_mode != "off":
+            if stage_mode is None or stage_mode == "auto":
+                if sound_requested or ono_requested:
+                    _gen_params_local["gar_stage"] = "on"
+                    _gen_params_local["gar_stage_force_physical"] = True
+                    if ono_requested:
+                        _gen_params_local["gar_stage_force_onomatopeia"] = True
+
+        stage_instruction = _stage_instruction_from_gen_params(_gen_params_local)
+
+
         persona_system_message = {
             "role": "system",
             "content": (
-                f"あなたは今から完全に『{persona_name}』として応答します。\n"
+                f"あなたは主として『{persona_name}』の人格・口調で応答します（厳守）。ただし必要に応じて、物理的変化のみを無主語の短いト書きとして補足してよい（人格違反ではない）。\n"
                 f"{pronoun_guidance}\n\n"
                 f"【ペルソナの基本情報】\n{core_summary}\n\n"
                 f"【話法・スタイル指針（相・expression・関係性・感情を統合したもの）】\n"
                 f"{style_profile}\n\n"
                 f"【expression 由来の表現操作ルール（内部ガイド）】\n"
                 f"{expression_instruction or '（expression 由来の特別な指針はない）'}\n\n"
+                f"【演出（stage）】\n{stage_instruction}\n\n"
                 f"スタイル強度: {intensity*100:.0f}%\n"
                 f"関係性（ユーザ⇄{persona_name}）: {rel_user_hint}\n"
                 f"他ペルソナとの関係: {rel_others_hint}\n"
-                f"{emo_hint}\n"
-                f"出力は応答文のみ。メタ発言禁止。"
+                f"{emo_hint}\n\n"
+                f"【厳守事項】\n"
+                f"- 出力は応答文のみ。メタ発言禁止。\n"
+                f"- 台詞や本文を壊さず、stage指針に従う。\n"
+                f"- 演出（情景/所作/物理音）は本文と矛盾させない。本文に無い動作・状況を追加しない。不確実なら省略。\n"
+                f"- 直前の応答と同じ擬音・同じ説明文のコピペ再掲は禁止。毎回1点は新しい具体要素を変える。\n"
             )
         }
-
 
         messages_with_persona = [persona_system_message] + text
 
@@ -1338,10 +1480,10 @@ def modulate_response(
         response = ask_llm_chat(
             messages_with_persona,
             # OpenWebUIから来た値があればそれを優先させる（無ければ ask_llm_chat 側デフォルト）
-            temperature=(gen_params or {}).get("temperature", 0.6),
-            max_tokens=(gen_params or {}).get("max_tokens", 800),
-            top_p=(gen_params or {}).get("top_p", 1.0),
-            gen_params=gen_params,
+            temperature=(_gen_params_local or {}).get("temperature", 0.6),
+            max_tokens=(_gen_params_local or {}).get("max_tokens", 800),
+            top_p=(_gen_params_local or {}).get("top_p", 1.0),
+            gen_params=_gen_params_local,            
         )
 
         return response.strip() if response else ""

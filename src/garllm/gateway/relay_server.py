@@ -14,7 +14,10 @@ style_layer / context_layer / persona_layer と連携して
 - env_utils.py によりデータパスを一元管理
 
 起動例:
-    python3 relay_server.py --host 0.0.0.0 --port 8081
+    - modules/gar-llm/src/garllm/gateway/relay_server.py を直接起動
+        python3 relay_server.py --host 0.0.0.0 --port 8081
+    - editable install 後は以下のようにモジュール経由で起動可能
+        python -m garllm.gateway.relay_server --host 0.0.0.0 --port 8081 --debug
 
 API利用例:
     curl -X POST http://localhost:8081/v1/chat/completions \
@@ -36,9 +39,12 @@ import os
 import sys
 import json
 import time
+
 import subprocess
 from pathlib import Path
-from fastapi import FastAPI, Request, BackgroundTasks
+
+from collections import OrderedDict
+from fastapi import FastAPI, Request, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 
 import garllm
@@ -78,9 +84,64 @@ logger = get_logger("relay_server", level="INFO", to_console=False)
 # ============================================================
 app = FastAPI(title="GAR-LLM Relay Server", version="1.2.0")
 
+
 # ============================================================
 # 補助関数群
 # ============================================================
+
+# ============================================================
+# Completion Runtime Profile Cache (observer API)
+# ============================================================
+_PROFILE_CACHE: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_PROFILE_TTL_SEC = int(os.getenv("GAR_PROFILE_TTL_SEC", "600"))   # 10 min
+_PROFILE_MAX_ITEMS = int(os.getenv("GAR_PROFILE_MAX_ITEMS", "2048"))
+
+def _cache_profile(completion_id: str, profile: dict) -> None:
+    now = time.time()
+
+    # purge expired (oldest first)
+    expire_before = now - _PROFILE_TTL_SEC
+    keys_to_delete = []
+    for k, (ts, _) in _PROFILE_CACHE.items():
+        if ts < expire_before:
+            keys_to_delete.append(k)
+        else:
+            break
+    for k in keys_to_delete:
+        _PROFILE_CACHE.pop(k, None)
+
+    # upsert
+    _PROFILE_CACHE[completion_id] = (now, profile)
+    _PROFILE_CACHE.move_to_end(completion_id, last=True)
+
+    # enforce max size
+    while len(_PROFILE_CACHE) > _PROFILE_MAX_ITEMS:
+        _PROFILE_CACHE.popitem(last=False)
+
+def _get_cached_profile(completion_id: str) -> dict | None:
+    item = _PROFILE_CACHE.get(completion_id)
+    if not item:
+        return None
+    ts, profile = item
+    if (time.time() - ts) > _PROFILE_TTL_SEC:
+        _PROFILE_CACHE.pop(completion_id, None)
+        return None
+    return profile
+
+def _load_persona_voice_block(persona_name: str) -> dict:
+    """persona_<name>.json から voice ブロックを安全に読み出す。無ければ {}。"""
+    p = _persona_path_for(persona_name)
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        v = data.get("voice")
+        return v if isinstance(v, dict) else {}
+    except Exception as e:
+        logger.warning(f"[profile] failed to load persona voice: {p}: {e}")
+        return {}
+
 
 def _is_internal_prompt(message_text: str) -> bool:
     patterns = ["### Task:", "### Chat History:", "### Output:", "### Guidelines:"]
@@ -321,6 +382,20 @@ def _run_style_modulator(persona_name: str, text: str, intensity: float, verbose
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": time.time()}
+
+
+# ============================================================
+# GAR Observer API: runtime_profile by completion_id
+# ============================================================
+@app.get("/v1/gar/runtime_profile")
+async def get_runtime_profile(
+    completion_id: str = Query(..., description="OpenAI互換レスポンスのid (chatcmpl-...)")
+):
+    prof = _get_cached_profile(completion_id)
+    if prof is None:
+        return JSONResponse(status_code=404, content={"error": "profile_not_found", "completion_id": completion_id})
+    return JSONResponse(content=prof)
+
 
 # ============================================================
 # OpenAI API 互換: モデル一覧
@@ -685,8 +760,21 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     keep_one = (args.prefix_persona == "on") and (persona_name and persona_name != "default")
     rewritten = _normalize_persona_prefix(rewritten, persona_name, keep_one)
 
+    # --- completion_id を先に確定（このIDが参照キーになる） ---
+    completion_id = f"chatcmpl-{os.urandom(8).hex()}"
+
+    # --- この応答生成に使った state（= このターンの basis）と persona voice をスナップショット ---
+    voice_block = _load_persona_voice_block(persona_name)
+    runtime_profile = {
+        "completion_id": completion_id,
+        "persona": {"id": persona_name},
+        "emotion": {"axes": emotion_axes},
+        "voice": voice_block,
+        "created": int(time.time()),
+    }
+
     response = {
-        "id": f"chatcmpl-{os.urandom(8).hex()}",
+        "id": completion_id,
         "object": "chat.completion",
         "created": int(time.time()),
         "model": "gar-llm",
@@ -697,7 +785,10 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
         }],
         "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
     }
+
+    _cache_profile(completion_id, runtime_profile)
     return JSONResponse(content=response)
+
 
 # ============================================================
 # エントリポイント

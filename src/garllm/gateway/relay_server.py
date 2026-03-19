@@ -53,6 +53,7 @@ from garllm.style_layer.response_modulator import modulate_response
 from garllm.utils.logger import get_logger
 from garllm.utils.llm_client import request_llm
 
+from garllm.gateway.render_plan_builder import build_render_plan
 
 # ============================================================
 # GAR 環境パス設定
@@ -127,6 +128,43 @@ def _get_cached_profile(completion_id: str) -> dict | None:
         _PROFILE_CACHE.pop(completion_id, None)
         return None
     return profile
+
+
+# ============================================================
+# Completion Render Plan Cache (observer API)
+# ============================================================
+_RENDER_PLAN_CACHE: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_RENDER_PLAN_TTL_SEC = int(os.getenv("GAR_RENDER_PLAN_TTL_SEC", "600"))   # 10 min
+_RENDER_PLAN_MAX_ITEMS = int(os.getenv("GAR_RENDER_PLAN_MAX_ITEMS", "2048"))
+
+def _cache_render_plan(completion_id: str, plan: dict) -> None:
+    now = time.time()
+
+    expire_before = now - _RENDER_PLAN_TTL_SEC
+    keys_to_delete = []
+    for k, (ts, _) in _RENDER_PLAN_CACHE.items():
+        if ts < expire_before:
+            keys_to_delete.append(k)
+        else:
+            break
+    for k in keys_to_delete:
+        _RENDER_PLAN_CACHE.pop(k, None)
+
+    _RENDER_PLAN_CACHE[completion_id] = (now, plan)
+    _RENDER_PLAN_CACHE.move_to_end(completion_id, last=True)
+
+    while len(_RENDER_PLAN_CACHE) > _RENDER_PLAN_MAX_ITEMS:
+        _RENDER_PLAN_CACHE.popitem(last=False)
+
+def _get_cached_render_plan(completion_id: str) -> dict | None:
+    item = _RENDER_PLAN_CACHE.get(completion_id)
+    if not item:
+        return None
+    ts, plan = item
+    if (time.time() - ts) > _RENDER_PLAN_TTL_SEC:
+        _RENDER_PLAN_CACHE.pop(completion_id, None)
+        return None
+    return plan
 
 def _load_persona_voice_block(persona_name: str) -> dict:
     """persona_<name>.json から voice ブロックを安全に読み出す。無ければ {}。"""
@@ -395,6 +433,19 @@ async def get_runtime_profile(
     if prof is None:
         return JSONResponse(status_code=404, content={"error": "profile_not_found", "completion_id": completion_id})
     return JSONResponse(content=prof)
+
+
+@app.get("/v1/gar/render_plan")
+async def get_render_plan(
+    completion_id: str = Query(..., description="OpenAI互換レスポンスのid (chatcmpl-...)")
+):
+    plan = _get_cached_render_plan(completion_id)
+    if plan is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "render_plan_not_found", "completion_id": completion_id}
+        )
+    return JSONResponse(content=plan)
 
 
 # ============================================================
@@ -787,6 +838,14 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     }
 
     _cache_profile(completion_id, runtime_profile)
+
+    render_plan = build_render_plan(
+        completion_id=completion_id,
+        persona_name=persona_name,
+        display_text=rewritten,
+    )
+    _cache_render_plan(completion_id, render_plan)
+
     return JSONResponse(content=response)
 
 

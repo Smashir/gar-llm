@@ -58,6 +58,9 @@ persona-based reasoning, context condensation, and style modulation across multi
 ---
 
 ## 🚀 Quick Start (Docker)
+
+python -m garllm.gateway.relay_server --host 0.0.0.0 --port 8081 --debug
+
 cd webui
 docker compose up -d
 

@@ -1,18 +1,17 @@
-"""Render plan builder with stage-aware segment extraction.
+"""Render plan builder with typed visible/audible segments.
 
 Design goals:
 - keep existing OpenAI-compatible chat response untouched
 - keep runtime_profile cache untouched
 - enrich only the side-channel render_plan
-- preserve backward compatibility for direct gar-llm -> WebUI usage
+- registered non-speech tags become structured segments
+- preserve backward compatibility for current voice-bridge integration
 
-Current behavior:
-- display_text: original rewritten text 그대로保持
-- speech_text: stage blocks removed text for TTS
-- segments:
-    * ambience (optional, inferred from stage text)
-    * foley    (optional, parsed from 【物理音】)
-    * speech   (main spoken text)
+Notes:
+- `display_text` at the top level remains the original response text
+- `visible_text` is the tag-stripped text suitable for UI rendering
+- `spoken_text` is the speech-only text suitable for TTS rendering
+- segment discriminator uses `type` (and keeps legacy `kind` for compatibility)
 """
 
 from __future__ import annotations
@@ -20,7 +19,22 @@ from __future__ import annotations
 import re
 from typing import Any
 
-_STAGE_HEAD_RE = re.compile(r"^\s*【(情景|所作|物理音)】\s*(.*)$")
+
+_TAG_HEAD_RE = re.compile(r"^\s*【([^】]+)】\s*(.*)$")
+
+_NON_SPEECH_TAG_TYPES: dict[str, str] = {
+    "情景": "scene",
+    "所作": "action",
+    "物理音": "foley",
+    "環境音": "ambience",
+    "BGM": "music",
+}
+
+_SPEECH_HINT_TAGS: set[str] = {
+    "セリフ",
+    "台詞",
+    "発話",
+}
 
 
 def _strip_exact_speaker_prefix(text: str, speaker: str | None) -> str:
@@ -50,61 +64,6 @@ def _collapse_lines(lines: list[str]) -> str:
     return "\n".join(out).strip()
 
 
-def _extract_stage_blocks(text: str) -> tuple[str, dict[str, str]]:
-    """
-    Parse simple stage blocks:
-
-    【情景】
-    ...
-    【所作】
-    ...
-    【物理音】
-    ...
-
-    Heuristic:
-    - a blank line ends the current block
-    - lines outside blocks are treated as spoken body
-    """
-    if not text:
-        return "", {}
-
-    body_lines: list[str] = []
-    sections: dict[str, list[str]] = {
-        "情景": [],
-        "所作": [],
-        "物理音": [],
-    }
-    current: str | None = None
-
-    for raw in text.splitlines():
-        stripped = raw.strip()
-
-        if current is not None and not stripped:
-            current = None
-            continue
-
-        m = _STAGE_HEAD_RE.match(stripped)
-        if m:
-            current = m.group(1)
-            tail = (m.group(2) or "").strip()
-            if tail:
-                sections[current].append(tail)
-            continue
-
-        if current is None:
-            body_lines.append(raw)
-        else:
-            sections[current].append(raw)
-
-    body_text = _collapse_lines(body_lines)
-    cleaned_sections = {
-        name: _collapse_lines(lines)
-        for name, lines in sections.items()
-        if _collapse_lines(lines)
-    }
-    return body_text, cleaned_sections
-
-
 def _normalize_cue_text(text: str) -> str:
     value = (text or "").strip()
     value = re.sub(r"^[\-\*\u2022・●]+", "", value).strip()
@@ -113,54 +72,170 @@ def _normalize_cue_text(text: str) -> str:
 
 
 def _split_physical_cues(physical_text: str) -> list[str]:
-    """
-    Split 【物理音】 block into simple cue strings.
-    Keeps ellipsis / repeated onomatopoeia as one cue when possible.
-    """
     if not physical_text:
         return []
 
     cues: list[str] = []
     seen: set[str] = set()
 
-    for raw_line in physical_text.splitlines():
-        line = _normalize_cue_text(raw_line)
-        if not line:
-            continue
+    # Prefer explicit onomatopoeia inside parentheses.
+    paren_hits = re.findall(r"[（(]([^()（）]+)[)）]", physical_text)
+    for hit in paren_hits:
+        cue = _normalize_cue_text(hit)
+        if cue and cue not in seen:
+            seen.add(cue)
+            cues.append(cue)
 
-        parts = re.split(r"[、,，/／|]", line)
-        for part in parts:
-            cue = _normalize_cue_text(part)
-            if not cue:
-                continue
-            if cue not in seen:
-                seen.add(cue)
-                cues.append(cue)
+    chunks = re.split(r"[、,，/／|]|(?:\s+と\s+)", physical_text)
+    for raw in chunks:
+        cue = _normalize_cue_text(raw)
+        if not cue:
+            continue
+        if len(cue) > 48 and not re.search(r"[ァ-ヴーぁ-んA-Za-z0-9]", cue):
+            continue
+        if cue not in seen:
+            seen.add(cue)
+            cues.append(cue)
 
     return cues
 
 
-_AMBIENCE_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("rain", ["雨", "雨音", "土砂降り", "霧雨", "しとしと", "ざぁ", "ざー", "ザー"]),
-    ("wind", ["風", "風音", "突風", "木枯らし", "びゅう", "びゅー", "ヒュウ"]),
-    ("thunder", ["雷", "稲妻", "ごろごろ", "ゴロゴロ"]),
-    ("waves", ["波", "潮騒", "海鳴り", "波音", "海辺"]),
-    ("fire", ["焚き火", "暖炉", "炎", "火の粉", "薪", "炉"]),
-    ("forest", ["森", "林", "木々", "虫の音", "林間"]),
-    ("crowd", ["雑踏", "群衆", "人混み", "市場", "ざわめき", "喧騒"]),
-]
+def _split_loose_cues(text: str) -> list[str]:
+    if not text:
+        return []
+    cues: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[\n、,，/／|]", text):
+        cue = _normalize_cue_text(raw)
+        if cue and cue not in seen:
+            seen.add(cue)
+            cues.append(cue)
+    return cues
 
 
-def _infer_ambience_cues(scene_text: str, action_text: str, physical_text: str) -> list[str]:
-    merged = "\n".join([scene_text or "", action_text or "", physical_text or ""])
-    if not merged.strip():
+def _parse_blocks(text: str) -> list[dict[str, Any]]:
+    """
+    Parse response text into ordered blocks.
+
+    Rules:
+    - only registered non-speech tags become special blocks
+    - speech-hint tags are stripped and their contents are treated as speech
+    - unknown tags remain part of ordinary speech text
+    """
+    if not text:
         return []
 
-    found: list[str] = []
-    for cue, keywords in _AMBIENCE_KEYWORDS:
-        if any(k in merged for k in keywords):
-            found.append(cue)
-    return found
+    blocks: list[dict[str, Any]] = []
+    speech_lines: list[str] = []
+    current_special: dict[str, Any] | None = None
+
+    def flush_speech() -> None:
+        nonlocal speech_lines
+        collapsed = _collapse_lines(speech_lines)
+        if collapsed:
+            blocks.append({"type": "speech", "lines": [collapsed]})
+        speech_lines = []
+
+    def flush_special() -> None:
+        nonlocal current_special
+        if current_special is None:
+            return
+        collapsed = _collapse_lines(current_special.get("lines", []))
+        if collapsed:
+            blocks.append(
+                {
+                    "type": current_special["type"],
+                    "tag": current_special["tag"],
+                    "lines": [collapsed],
+                }
+            )
+        current_special = None
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        m = _TAG_HEAD_RE.match(stripped)
+
+        if m:
+            tag = (m.group(1) or "").strip()
+            tail = (m.group(2) or "").strip()
+
+            # any new tag ends the previous special block
+            if current_special is not None:
+                flush_special()
+
+            if tag in _NON_SPEECH_TAG_TYPES:
+                flush_speech()
+                current_special = {
+                    "type": _NON_SPEECH_TAG_TYPES[tag],
+                    "tag": tag,
+                    "lines": [],
+                }
+                if tail:
+                    current_special["lines"].append(tail)
+                continue
+
+            if tag in _SPEECH_HINT_TAGS:
+                if tail:
+                    speech_lines.append(tail)
+                continue
+
+            # Unknown tag -> leave untouched as speech text.
+            speech_lines.append(raw)
+            continue
+
+        if current_special is not None:
+            if stripped:
+                current_special["lines"].append(raw)
+            else:
+                flush_special()
+            continue
+
+        speech_lines.append(raw)
+
+    flush_special()
+    flush_speech()
+    return blocks
+
+
+def _make_speech_segment(text: str, speaker: str) -> dict[str, Any]:
+    return {
+        "type": "speech",
+        "kind": "speech",
+        "display_text": text,
+        "spoken_text": text,
+        "visible": True,
+        "audible": True,
+        "speaker": speaker,
+        "renderer": "persona_tts",
+    }
+
+
+def _make_visible_only_segment(seg_type: str, text: str) -> dict[str, Any]:
+    return {
+        "type": seg_type,
+        "kind": seg_type,
+        "display_text": text,
+        "spoken_text": None,
+        "visible": True,
+        "audible": False,
+        "renderer": None,
+    }
+
+
+def _make_audio_segment(seg_type: str, cue: str, prompt: str, renderer: str, placement: str, level_db: float) -> dict[str, Any]:
+    return {
+        "type": seg_type,
+        "kind": seg_type,
+        "cue": cue,
+        "prompt": prompt,
+        "display_text": None,
+        "spoken_text": None,
+        "visible": False,
+        "audible": True,
+        "renderer": renderer,
+        "placement": placement,
+        "level_db": level_db,
+    }
 
 
 def build_render_plan(
@@ -170,69 +245,107 @@ def build_render_plan(
     display_text: str,
 ) -> dict[str, Any]:
     raw_text = _strip_exact_speaker_prefix(display_text, persona_name)
-
-    body_text, stage = _extract_stage_blocks(raw_text)
-    speech_text = body_text.strip() if body_text.strip() else raw_text.strip()
-
-    scene_text = stage.get("情景", "")
-    action_text = stage.get("所作", "")
-    physical_text = stage.get("物理音", "")
-
-    ambience_cues = _infer_ambience_cues(scene_text, action_text, physical_text)
-    physical_cues = _split_physical_cues(physical_text)
+    parsed_blocks = _parse_blocks(raw_text)
 
     segments: list[dict[str, Any]] = []
 
-    for cue in ambience_cues:
-        segments.append(
-            {
-                "kind": "ambience",
-                "cue": cue,
-                "text": cue,
-                "audible": True,
-                "visible": False,
-                "renderer": "sfx_catalog",
-                "placement": "underlay",
-                "level_db": -26.0,
-            }
-        )
+    stage: dict[str, str] = {
+        "scene": "",
+        "action": "",
+        "physical": "",
+        "ambience": "",
+        "music": "",
+    }
 
-    for cue in physical_cues:
-        segments.append(
-            {
-                "kind": "foley",
-                "cue": cue,
-                "text": cue,
-                "audible": True,
-                "visible": False,
-                "renderer": "sfx_catalog",
-                "placement": "lead_in",
-                "level_db": -10.0,
-            }
-        )
+    for block in parsed_blocks:
+        block_type = str(block.get("type") or "")
+        block_text = _collapse_lines(list(block.get("lines") or []))
+        if not block_text:
+            continue
 
-    if speech_text:
-        segments.append(
-            {
-                "kind": "speech",
-                "text": speech_text,
-                "speaker": persona_name,
-                "audible": True,
-                "visible": True,
-                "renderer": "persona_tts",
-            }
-        )
+        if block_type == "speech":
+            segments.append(_make_speech_segment(block_text, persona_name))
+            continue
+
+        if block_type == "scene":
+            stage["scene"] = block_text if not stage["scene"] else stage["scene"] + "\n" + block_text
+            segments.append(_make_visible_only_segment("scene", block_text))
+            continue
+
+        if block_type == "action":
+            stage["action"] = block_text if not stage["action"] else stage["action"] + "\n" + block_text
+            segments.append(_make_visible_only_segment("action", block_text))
+            continue
+
+        if block_type == "foley":
+            stage["physical"] = block_text if not stage["physical"] else stage["physical"] + "\n" + block_text
+            cues = _split_physical_cues(block_text) or [block_text]
+            for cue in cues:
+                segments.append(
+                    _make_audio_segment(
+                        "foley",
+                        cue=cue,
+                        prompt=cue,
+                        renderer="sfx_catalog",
+                        placement="lead_in",
+                        level_db=-10.0,
+                    )
+                )
+            continue
+
+        if block_type == "ambience":
+            stage["ambience"] = block_text if not stage["ambience"] else stage["ambience"] + "\n" + block_text
+            segments.append(
+                _make_audio_segment(
+                    "ambience",
+                    cue=block_text,
+                    prompt=block_text,
+                    renderer="sfx_or_model",
+                    placement="underlay",
+                    level_db=-24.0,
+                )
+            )
+            continue
+
+        if block_type == "music":
+            stage["music"] = block_text if not stage["music"] else stage["music"] + "\n" + block_text
+            segments.append(
+                _make_audio_segment(
+                    "music",
+                    cue=block_text,
+                    prompt=block_text,
+                    renderer="music_or_model",
+                    placement="underlay",
+                    level_db=-28.0,
+                )
+            )
+            continue
+
+    visible_parts = [
+        str(seg.get("display_text") or "").strip()
+        for seg in segments
+        if bool(seg.get("visible", False)) and str(seg.get("display_text") or "").strip()
+    ]
+    visible_text = "\n".join(visible_parts).strip()
+
+    spoken_parts = [
+        str(seg.get("spoken_text") or "").strip()
+        for seg in segments
+        if str(seg.get("type") or seg.get("kind") or "").lower() == "speech"
+        and bool(seg.get("audible", False))
+        and str(seg.get("spoken_text") or "").strip()
+    ]
+    spoken_text = "\n".join(spoken_parts).strip()
 
     return {
-        "version": "0.3",
+        "version": "1.0",
         "completion_id": completion_id,
         "default_speaker": persona_name,
-        "speech_text": speech_text,
         "display_text": display_text,
-        "stage": {
-            "scene": scene_text,
-            "action": action_text,
-            "physical": physical_text,
-        },
+        "visible_text": visible_text,
+        "spoken_text": spoken_text,
+        # backward compatibility
+        "speech_text": spoken_text,
+        "stage": stage,
         "segments": segments,
     }
